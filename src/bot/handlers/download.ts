@@ -1,4 +1,4 @@
-import { bot, getAdminId } from '../client';
+import { bot, getAdminId, setMessageReaction } from '../client';
 import * as db from '../database';
 import { pino } from 'pino';
 
@@ -72,7 +72,7 @@ export function registerDownload() {
     await deliverFiles(ctx, payload);
   });
 
-  // Callback for "I've Joined All"
+  // Callback for "I've Joined"
   bot.action(/^chk:(.+)$/, async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     const payload = ctx.match[1];
@@ -80,7 +80,7 @@ export function registerDownload() {
     
     const missing = await checkMembership(ctx, userId);
     if (missing.length > 0) {
-      return ctx.answerCbQuery(`Still missing channels: ${missing.length}`, { show_alert: true });
+      return ctx.answerCbQuery('⚠️ Please join our main channel first to get access!', { show_alert: true });
     }
 
     await ctx.deleteMessage().catch(() => {});
@@ -134,37 +134,56 @@ export function registerDownload() {
 }
 
 async function checkMembership(ctx: any, userId: number): Promise<string[]> {
-  const missing: string[] = [];
-  for (const [key, channel] of Object.entries(PUBLIC_CHANNELS)) {
-    if (!channel) continue;
-    try {
-      const member = await ctx.telegram.getChatMember(channel, userId);
-      if (['left', 'kicked', 'restricted'].includes(member.status)) {
-        missing.push(key);
-      }
-    } catch (e) {
-      logger.error({ err: e, channel }, 'Error checking membership');
-      // If channel is private or inaccessible, skip
-    }
+  // Check if admin has disabled joined channel check
+  const forceSub = db.getConfig('FORCE_SUB_ENABLED');
+  if (forceSub === 'false' || forceSub === 'off') {
+    return [];
   }
-  return missing;
+
+  // Admin users bypass channel check
+  if (userId.toString() === getAdminId()) {
+    return [];
+  }
+
+  // Limit check to ONLY the main channel as requested
+  const mainChannel = PUBLIC_CHANNELS.main || process.env.CH_MAIN || '';
+  if (!mainChannel) return [];
+
+  try {
+    const member = await ctx.telegram.getChatMember(mainChannel, userId);
+    if (['left', 'kicked', 'restricted'].includes(member.status)) {
+      return ['main'];
+    }
+  } catch (e) {
+    logger.error({ err: e, channel: mainChannel }, 'Error checking membership for main channel');
+  }
+  return [];
 }
 
 function showJoinRequired(ctx: any, missing: string[], payload: string) {
-  const keyboard: any[][] = missing.map(key => ([{
-    text: `🤡 Join ${key.toUpperCase()}`,
-    url: `https://t.me/${PUBLIC_CHANNELS[key].replace('@', '')}`
-  }]));
+  const mainChannel = PUBLIC_CHANNELS.main || process.env.CH_MAIN || '@VinehillMain';
+  const channelLink = `https://t.me/${mainChannel.replace('@', '')}`;
 
-  keyboard.push([{
-    text: "🤡 I've Joined All",
-    callback_data: `chk:${payload}`
-  }]);
+  const keyboard: any[][] = [
+    [{
+      text: '📢 Join Our Main Channel',
+      url: channelLink
+    }],
+    [{
+      text: "🤡 I've Joined",
+      callback_data: `chk:${payload}`
+    }]
+  ];
 
-  return ctx.reply('<b>🤡 Access Required</b>\n\nYou must join our channels to receive files.', {
-    parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: keyboard }
-  });
+  return ctx.reply(
+    '🤡 <b>Access Required</b>\n\n' +
+    'Please join our <b>Main Channel</b> to download files from Vinehill.\n\n' +
+    'Once joined, click the <b>I\'ve Joined</b> button below to receive your files!',
+    {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: keyboard }
+    }
+  );
 }
 
 async function deliverFiles(ctx: any, encodedPayload: string, skipCheck = false) {
@@ -276,33 +295,40 @@ async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string) {
   sentMsgIds.push(warnMsg.message_id);
 
   for (const f of files) {
+    let inline_keyboard: any[][] | undefined = undefined;
     try {
-      const sizeMB = f.file_size ? (f.file_size / (1024 * 1024)).toFixed(1) + ' MB' : 'Unknown size';
-      const yearPart = f.year ? ` (${f.year})` : '';
-      const qualityPart = f.quality ? ` [${f.quality}]` : '';
-      const episodePart = (f.season && f.episode) ? ` S${f.season.toString().padStart(2, '0')}E${f.episode.toString().padStart(2, '0')}` : '';
-      const cleanedTitle = db.cleanTitle(f.title);
+      const isMovie = f.category === 'movies';
 
-      const caption = 
-        `🤡 <b>${cleanedTitle}${yearPart}</b>${episodePart}${qualityPart}\n\n` +
-        `@VinehillBot`;
+      // Keep buttons attached for ONLY movies as requested
+      if (isMovie) {
+        const favPayloadString = `${f.category}:${f.title}`;
+        const favPayload = Buffer.from(favPayloadString).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        const likeCount = db.getLikeCount(f.title, f.category);
+        
+        inline_keyboard = [
+          [
+            { text: `🤡 ${likeCount}`, callback_data: `like:${favPayload}` },
+            { text: '🤡 Favorite', callback_data: `fav:${favPayload}` },
+            { text: '🚩 Report', callback_data: `rpt:${favPayload}` }
+          ]
+        ];
 
-      const favPayloadString = `${f.category}:${f.title}`;
-      const favPayload = Buffer.from(favPayloadString).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-      const likeCount = db.getLikeCount(f.title, f.category);
-      
-      const inline_keyboard: any[][] = [
-        [
-          { text: `🤡 ${likeCount}`, callback_data: `like:${favPayload}` },
-          { text: '🤡 Favorite', callback_data: `fav:${favPayload}` },
-          { text: '🚩 Report', callback_data: `rpt:${favPayload}` }
-        ]
-      ];
+        // Add Admin Delete Button
+        if (ctx.from.id.toString() === getAdminId()) {
+          const delPayload = Buffer.from(`${f.category}:${f.title}`).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+          inline_keyboard.push([{ text: '🗑️ Delete Media (Admin)', callback_data: `adm_del_conf:${delPayload}` }]);
+        }
+      }
 
-      // Add Admin Delete Button
-      if (ctx.from.id.toString() === getAdminId()) {
-        const delPayload = Buffer.from(`${f.category}:${f.title}`).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-        inline_keyboard.push([{ text: '🗑️ Delete Media (Admin)', callback_data: `adm_del_conf:${delPayload}` }]);
+      // No caption for delivered files (clean renamed file delivery)
+      const copyExtra: any = { caption: '' };
+      if (inline_keyboard) {
+        copyExtra.reply_markup = { inline_keyboard };
+      }
+
+      const docExtra: any = {};
+      if (inline_keyboard) {
+        docExtra.reply_markup = { inline_keyboard };
       }
 
       let sent: any = null;
@@ -310,11 +336,7 @@ async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string) {
       // 1. Primary delivery: If channel_id and message_id are available, copyMessage is the most robust
       if (f.channel_id && f.message_id) {
         try {
-          sent = await ctx.telegram.copyMessage(ctx.from.id, f.channel_id, f.message_id, {
-            caption,
-            parse_mode: 'HTML',
-            reply_markup: { inline_keyboard }
-          });
+          sent = await ctx.telegram.copyMessage(ctx.from.id, f.channel_id, f.message_id, copyExtra);
         } catch (copyErr) {
           logger.warn({ copyErr, file: f.title }, 'copyMessage failed, falling back...');
         }
@@ -323,11 +345,7 @@ async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string) {
       // 2. Secondary delivery: If file_id is a valid Bot API file_id (not a raw MTProto digits-only ID)
       if (!sent && f.file_id && !/^\d+$/.test(f.file_id)) {
         try {
-          sent = await ctx.replyWithDocument(f.file_id, {
-            caption,
-            parse_mode: 'HTML',
-            reply_markup: { inline_keyboard }
-          });
+          sent = await ctx.replyWithDocument(f.file_id, docExtra);
         } catch (docErr) {
           logger.warn({ docErr, file: f.title }, 'replyWithDocument failed');
         }
@@ -347,11 +365,7 @@ async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string) {
             );
             if (matched) {
               db.updateFileLocation(f.file_id, targetChan.toString(), matched.id);
-              sent = await ctx.telegram.copyMessage(ctx.from.id, targetChan, matched.id, {
-                caption,
-                parse_mode: 'HTML',
-                reply_markup: { inline_keyboard }
-              });
+              sent = await ctx.telegram.copyMessage(ctx.from.id, targetChan, matched.id, copyExtra);
             }
           }
         } catch (legacyErr) {
@@ -361,6 +375,8 @@ async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string) {
 
       if (sent) {
         sentMsgIds.push(sent.message_id);
+        // Add clown emoji reaction to received file!
+        setMessageReaction(ctx.telegram, ctx.from.id, sent.message_id, '🤡').catch(() => {});
         await new Promise(r => setTimeout(r, 800)); // Respect rate limits
       } else {
         throw new Error('File delivery failed: media identifier could not be resolved');
@@ -370,12 +386,10 @@ async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string) {
       if (error.response?.status === 429) {
         const wait = (error.parameters?.retry_after || 5) * 1000;
         await new Promise(r => setTimeout(r, wait));
-        const cleanedTitle = db.cleanTitle(f.title);
-        const sent = await ctx.replyWithDocument(f.file_id, {
-          caption: `🤡 <b>${cleanedTitle}</b>\n@VinehillBot`,
-          parse_mode: 'HTML'
-        });
+        const retryExtra: any = (f.category === 'movies' && inline_keyboard) ? { reply_markup: { inline_keyboard } } : {};
+        const sent = await ctx.replyWithDocument(f.file_id, retryExtra);
         sentMsgIds.push(sent.message_id);
+        setMessageReaction(ctx.telegram, ctx.from.id, sent.message_id, '🤡').catch(() => {});
       } else {
         await ctx.reply(`❌ <b>Failed to deliver:</b> ${db.cleanTitle(f.title)}\n<i>Reason: ${error.message || 'Internal Error'}</i>`, { parse_mode: 'HTML' }).catch(() => {});
       }

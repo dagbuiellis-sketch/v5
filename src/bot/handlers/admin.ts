@@ -283,4 +283,138 @@ export function registerAdmin() {
       ctx.reply('❌ <b>Error:</b> Failed to decode or delete the link provided.', { parse_mode: 'HTML' });
     }
   });
+
+  // Helper for force-sub state
+  function isForceSubEnabled(): boolean {
+    const val = db.getConfig('FORCE_SUB_ENABLED');
+    return val !== 'false' && val !== 'off';
+  }
+
+  function getDashboardView() {
+    const isEnabled = isForceSubEnabled();
+    const mainChan = process.env.CH_MAIN || '@VinehillMain';
+    const stats = db.getStats();
+
+    const text = 
+      `⚙️ 🤡 <b>Vinehill Admin Dashboard</b>\n\n` +
+      `📢 <b>Joined Channel Check:</b> ${isEnabled ? '🟢 <b>ENABLED</b> (Main Channel Only)' : '🔴 <b>DISABLED</b> (Open / Free Access)'}\n` +
+      `🎯 <b>Main Channel:</b> <code>${mainChan}</code>\n` +
+      `📦 <b>Total Files in Library:</b> ${stats?.totalFiles ?? 'N/A'}\n` +
+      `👥 <b>Total Registered Users:</b> ${stats?.totalUsers ?? 'N/A'}\n\n` +
+      `<i>Use the buttons below to toggle channel checks or manage library tasks:</i>`;
+
+    const buttons = [
+      [{ text: `📢 Channel Check: ${isEnabled ? '🟢 ENABLED (Click to Turn OFF)' : '🔴 DISABLED (Click to Turn ON)'}`, callback_data: 'adm_toggle_forcesub' }],
+      [
+        { text: '📊 Full Stats', callback_data: 'adm:stats' },
+        { text: '🔄 Sync Announcements', callback_data: 'adm:sync' }
+      ],
+      [
+        { text: '🧹 Purge Orphaned Files', callback_data: 'adm:purge' },
+        { text: '❌ Close Dashboard', callback_data: 'adm:close' }
+      ]
+    ];
+
+    return { text, buttons };
+  }
+
+  // /admin command & nav:admin callback
+  bot.command('admin', async (ctx) => {
+    if (ctx.from.id.toString() !== getAdminId()) return;
+    const { text, buttons } = getDashboardView();
+    ctx.reply(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
+  });
+
+  bot.action('nav:admin', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (ctx.from.id.toString() !== getAdminId()) return;
+    const { text, buttons } = getDashboardView();
+    ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } }).catch(() => {
+      ctx.reply(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
+    });
+  });
+
+  // Toggle Force-Sub Action
+  bot.action('adm_toggle_forcesub', async (ctx) => {
+    if (ctx.from.id.toString() !== getAdminId()) {
+      return ctx.answerCbQuery('Forbidden', { show_alert: true });
+    }
+    const current = isForceSubEnabled();
+    const nextVal = current ? 'false' : 'true';
+    db.setConfig('FORCE_SUB_ENABLED', nextVal);
+    
+    const nextStateStr = nextVal === 'true' ? '🟢 ENABLED' : '🔴 DISABLED';
+    await ctx.answerCbQuery(`Channel Check is now ${nextStateStr}!`, { show_alert: true });
+
+    const { text, buttons } = getDashboardView();
+    await ctx.editMessageText(text, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: buttons }
+    }).catch(() => {});
+  });
+
+  // /forcesub & /checkchannel commands
+  bot.command(['forcesub', 'checkchannel'], async (ctx) => {
+    if (ctx.from.id.toString() !== getAdminId()) return;
+    const arg = ctx.payload.trim().toLowerCase();
+    let isEnabled = isForceSubEnabled();
+
+    if (arg === 'on' || arg === 'enable' || arg === 'true') {
+      db.setConfig('FORCE_SUB_ENABLED', 'true');
+      isEnabled = true;
+    } else if (arg === 'off' || arg === 'disable' || arg === 'false') {
+      db.setConfig('FORCE_SUB_ENABLED', 'false');
+      isEnabled = false;
+    } else if (arg === 'toggle') {
+      const next = isEnabled ? 'false' : 'true';
+      db.setConfig('FORCE_SUB_ENABLED', next);
+      isEnabled = !isEnabled;
+    }
+
+    const { text, buttons } = getDashboardView();
+    return ctx.reply(text, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: buttons }
+    });
+  });
+
+  // Dashboard quick actions
+  bot.action('adm:stats', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (ctx.from.id.toString() !== getAdminId()) return;
+    const stats = db.getStats();
+    if (!stats) return ctx.reply('Error loading stats.');
+    
+    ctx.reply(
+      `📊 <b>🤡 Vinehill Admin Stats</b>\n\n` +
+      `📦 <b>Total Files:</b> ${stats.totalFiles}\n` +
+      `👥 <b>Total Users:</b> ${stats.totalUsers}\n` +
+      `📈 <b>Today's Requests:</b> ${stats.todayRequests}\n` +
+      `❤️ <b>Total Likes:</b> ${stats.totalLikes}\n\n` +
+      `🎬 <b>Movies:</b> ${stats.movies}\n` +
+      `📺 <b>Series:</b> ${stats.series}\n` +
+      `🍜 <b>Anime:</b> ${stats.anime}\n` +
+      `🎮 <b>Games:</b> ${stats.games}`,
+      { parse_mode: 'HTML' }
+    ).catch(() => {});
+  });
+
+  bot.action('adm:sync', async (ctx) => {
+    await ctx.answerCbQuery('Starting announcement sync...').catch(() => {});
+    if (ctx.from.id.toString() !== getAdminId()) return;
+    const { syncAnnouncements } = await import('./announcer');
+    await syncAnnouncements(ctx);
+  });
+
+  bot.action('adm:purge', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (ctx.from.id.toString() !== getAdminId()) return;
+    const result = db.purgeEmptyFiles();
+    ctx.reply(`🤡 <b>Purge Complete</b>\n\nRemoved <b>${result.changes}</b> orphaned file entries.`, { parse_mode: 'HTML' });
+  });
+
+  bot.action('adm:close', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await ctx.deleteMessage().catch(() => {});
+  });
 }

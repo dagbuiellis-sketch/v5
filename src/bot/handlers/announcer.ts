@@ -1,4 +1,4 @@
-import { bot, getAdminId } from '../client';
+import { bot, getAdminId, setMessageReaction } from '../client';
 import * as db from '../database';
 import { getShowStatus } from '../tmdb';
 import { pino } from 'pino';
@@ -150,6 +150,7 @@ async function _announceMovie(f: any) {
     parse_mode: 'HTML',
     ...keyboard
   });
+  setMessageReaction(bot.telegram, channel, sent.message_id, '🤡').catch(() => {});
 
   // Cross-post to Main
   let mainMsgId = null;
@@ -158,6 +159,7 @@ async function _announceMovie(f: any) {
       reply_markup: keyboard.reply_markup
     });
     mainMsgId = copied.message_id;
+    setMessageReaction(bot.telegram, PUBLIC_CHANNELS.main, copied.message_id, '🤡').catch(() => {});
   }
   db.saveAnnouncementInfo(f.title, f.category, sent.message_id, mainMsgId, channel);
 }
@@ -173,6 +175,7 @@ async function _announceGame(f: any) {
     parse_mode: 'HTML',
     ...keyboard
   });
+  setMessageReaction(bot.telegram, channel, sent.message_id, '🤡').catch(() => {});
 
   db.saveAnnouncementInfo(f.title, f.category, sent.message_id, null, channel);
 }
@@ -188,11 +191,13 @@ async function _announceSeries(f: any) {
     // Finished show: Post fresh
     const { caption, keyboard } = _buildSeriesCaption(f, false);
     const sent = await bot.telegram.sendPhoto(channel, f.poster_url, { caption, parse_mode: 'HTML', ...keyboard });
+    setMessageReaction(bot.telegram, channel, sent.message_id, '🤡').catch(() => {});
     
     let mainMsgId = null;
     if (PUBLIC_CHANNELS.main) {
       const copied = await bot.telegram.copyMessage(PUBLIC_CHANNELS.main, channel, sent.message_id, { reply_markup: keyboard.reply_markup });
       mainMsgId = copied.message_id;
+      setMessageReaction(bot.telegram, PUBLIC_CHANNELS.main, copied.message_id, '🤡').catch(() => {});
     }
     db.saveAnnouncementInfo(f.title, f.category, sent.message_id, mainMsgId, channel);
   } else {
@@ -207,11 +212,13 @@ async function _announceSeries(f: any) {
 
     const { caption, keyboard } = _buildSeriesCaption(f, true);
     const sent = await bot.telegram.sendPhoto(channel, f.poster_url, { caption, parse_mode: 'HTML', ...keyboard });
+    setMessageReaction(bot.telegram, channel, sent.message_id, '🤡').catch(() => {});
 
     let mainMsgId = null;
     if (PUBLIC_CHANNELS.main) {
       const copied = await bot.telegram.copyMessage(PUBLIC_CHANNELS.main, channel, sent.message_id, { reply_markup: keyboard.reply_markup });
       mainMsgId = copied.message_id;
+      setMessageReaction(bot.telegram, PUBLIC_CHANNELS.main, copied.message_id, '🤡').catch(() => {});
     }
     db.saveAnnouncementInfo(f.title, f.category, sent.message_id, mainMsgId, channel);
   }
