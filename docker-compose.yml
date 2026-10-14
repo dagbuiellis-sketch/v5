@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  vinehill-bot:
+    build: .
+    container_name: vinehill_bot
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - DATA_DIR=/app/data
+      - DB_PATH=/app/data/vinehill.db
+    ports:
+      - "3000:3000"
+    volumes:
+      # Keep database persistent across container updates
+      - vinehill-data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  vinehill-data:

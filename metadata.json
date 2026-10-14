@@ -1,0 +1,6 @@
+{
+  "name": "Vinehill Media Bot",
+  "description": "Multi-category media distribution bot with a React admin dashboard, automated indexing, and TMDB integration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

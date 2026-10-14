@@ -1,0 +1,150 @@
+{
+  "entities": {
+    "File": {
+      "title": "File",
+      "description": "Represents a media file stored/indexed by the bot",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "description": "Cleaned title of the media" },
+        "year": { "type": "integer", "description": "Release year" },
+        "category": { "type": "string", "description": "movies, series, anime, games" },
+        "quality": { "type": "string", "description": "Resolution quality" },
+        "season": { "type": "integer", "description": "Season number for series" },
+        "episode": { "type": "integer", "description": "Episode number for series" },
+        "file_id": { "type": "string", "description": "Telegram file unique ID" },
+        "file_name": { "type": "string", "description": "Original file name" },
+        "file_size": { "type": "integer", "description": "Size in bytes" },
+        "tags": { "type": "string", "description": "Internal search tags" },
+        "tmdb_id": { "type": "integer", "description": "TMDB ID for metadata" },
+        "poster_url": { "type": "string", "description": "URL to poster image" },
+        "overview": { "type": "string", "description": "Plot summary" },
+        "rating": { "type": "string", "description": "IMDB/TMDB rating" },
+        "genres": { "type": "string", "description": "Comma separated genres" },
+        "added_at": { "type": "string", "format": "date-time", "description": "When it was added to indices" }
+      },
+      "required": ["title", "category", "file_id"]
+    },
+    "User": {
+      "title": "User",
+      "description": "Bot user profile",
+      "type": "object",
+      "properties": {
+        "id": { "type": "integer", "description": "Telegram user ID" },
+        "username": { "type": "string", "description": "Telegram username" },
+        "first_name": { "type": "string", "description": "Telegram first name" },
+        "joined_at": { "type": "string", "format": "date-time", "description": "When they first used the bot" },
+        "is_banned": { "type": "boolean", "description": "True if user is banned" },
+        "request_count": { "type": "integer", "description": "Total requests made" }
+      },
+      "required": ["id", "first_name"]
+    },
+    "Delivery": {
+      "title": "Delivery",
+      "description": "Log of files delivered to users for auto-delete",
+      "type": "object",
+      "properties": {
+        "user_id": { "type": "integer", "description": "Recipient ID" },
+        "file_ids": { "type": "array", "description": "List of delivered file IDs" },
+        "msg_ids": { "type": "array", "description": "List of message IDs to delete" },
+        "delivered_at": { "type": "string", "format": "date-time", "description": "When delivered" },
+        "delete_at": { "type": "string", "format": "date-time", "description": "When to auto-delete" },
+        "deleted": { "type": "boolean", "description": "Whether it has been deleted" }
+      },
+      "required": ["user_id", "file_ids", "msg_ids", "delete_at"]
+    },
+    "Request": {
+      "title": "Request",
+      "description": "Search request log",
+      "type": "object",
+      "properties": {
+        "user_id": { "type": "integer" },
+        "query": { "type": "string" },
+        "requested_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["query"]
+    },
+    "Favorite": {
+      "title": "Favorite",
+      "description": "User favorite item",
+      "type": "object",
+      "properties": {
+        "user_id": { "type": "integer" },
+        "title": { "type": "string" },
+        "category": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["user_id", "title", "category"]
+    },
+    "Like": {
+      "title": "Like",
+      "description": "User like for a media item",
+      "type": "object",
+      "properties": {
+        "user_id": { "type": "integer" },
+        "title": { "type": "string" },
+        "category": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["user_id", "title", "category"]
+    },
+    "Report": {
+      "title": "Report",
+      "description": "Media report log",
+      "type": "object",
+      "properties": {
+        "user_id": { "type": "integer" },
+        "title": { "type": "string" },
+        "category": { "type": "string" },
+        "reported_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["user_id", "title", "category"]
+    },
+    "Announcement": {
+      "title": "Announcement",
+      "description": "Tracked channel announcements",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "category": { "type": "string" },
+        "msg_id": { "type": "integer" },
+        "main_msg_id": { "type": "integer" },
+        "channel": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "category", "msg_id", "channel"]
+    },
+    "Config": {
+      "title": "Config",
+      "description": "Global bot configuration",
+      "type": "object",
+      "properties": {
+        "key": { "type": "string" },
+        "value": { "type": "string" }
+      },
+      "required": ["key", "value"]
+    },
+    "SearchHistory": {
+      "title": "SearchHistory",
+      "description": "User search history record",
+      "type": "object",
+      "properties": {
+        "user_id": { "type": "integer" },
+        "query": { "type": "string" },
+        "searched_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["user_id", "query"]
+    }
+  },
+  "firestore": {
+    "/files/{fileId}": { "schema": "File", "description": "Media index" },
+    "/users/{userId}": { "schema": "User", "description": "Users data" },
+    "/deliveries/{deliveryId}": { "schema": "Delivery", "description": "Auto-delete tracker" },
+    "/requests/{requestId}": { "schema": "Request", "description": "Global requests log" },
+    "/favorites/{favoriteId}": { "schema": "Favorite", "description": "User favorites" },
+    "/likes/{likeId}": { "schema": "Like", "description": "User likes" },
+    "/reports/{reportId}": { "schema": "Report", "description": "Media reports" },
+    "/announcements/{announcementId}": { "schema": "Announcement", "description": "Channel post tracking" },
+    "/config/{configId}": { "schema": "Config", "description": "Bot settings" },
+    "/search_history/{historyId}": { "schema": "SearchHistory", "description": "User recent searches" }
+  }
+}

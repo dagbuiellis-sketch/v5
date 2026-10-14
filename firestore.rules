@@ -1,0 +1,93 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper Functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isAdmin() {
+      return isEmailVerified() && request.auth.token.email == 'ellisdagbui1@gmail.com';
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Entity Validations
+    function isValidFile(data) {
+      return data.title is string && data.title.size() <= 500 &&
+             data.category in ['movies', 'series', 'anime', 'games'] &&
+             data.file_id is string && data.file_id.size() <= 200;
+    }
+
+    function isValidUser(data) {
+      return data.id is int && data.first_name is string && data.first_name.size() <= 100;
+    }
+
+    // Rules
+    match /files/{fileId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /users/{userId} {
+      allow read: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
+      allow write: if isAdmin();
+    }
+
+    match /deliveries/{deliveryId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /requests/{requestId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /favorites/{favoriteId} {
+      allow read: if isAdmin() || (isSignedIn() && existing().user_id == request.auth.uid);
+      allow write: if isAdmin();
+    }
+
+    match /likes/{likeId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /reports/{reportId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /announcements/{announcementId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /config/{configId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /search_history/{historyId} {
+      allow read: if isAdmin() || (isSignedIn() && existing().user_id == request.auth.uid);
+      allow write: if isAdmin();
+    }
+  }
+}
