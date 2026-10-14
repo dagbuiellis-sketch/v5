@@ -305,13 +305,66 @@ async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string) {
         inline_keyboard.push([{ text: '🗑️ Delete Media (Admin)', callback_data: `adm_del_conf:${delPayload}` }]);
       }
 
-      const sent = await ctx.replyWithDocument(f.file_id, {
-        caption,
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard }
-      });
-      sentMsgIds.push(sent.message_id);
-      await new Promise(r => setTimeout(r, 800)); // Respect rate limits
+      let sent: any = null;
+
+      // 1. Primary delivery: If channel_id and message_id are available, copyMessage is the most robust
+      if (f.channel_id && f.message_id) {
+        try {
+          sent = await ctx.telegram.copyMessage(ctx.from.id, f.channel_id, f.message_id, {
+            caption,
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard }
+          });
+        } catch (copyErr) {
+          logger.warn({ copyErr, file: f.title }, 'copyMessage failed, falling back...');
+        }
+      }
+
+      // 2. Secondary delivery: If file_id is a valid Bot API file_id (not a raw MTProto digits-only ID)
+      if (!sent && f.file_id && !/^\d+$/.test(f.file_id)) {
+        try {
+          sent = await ctx.replyWithDocument(f.file_id, {
+            caption,
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard }
+          });
+        } catch (docErr) {
+          logger.warn({ docErr, file: f.title }, 'replyWithDocument failed');
+        }
+      }
+
+      // 3. Fallback for legacy raw MTProto document IDs (resolves existing files like VisionQuest in DB)
+      if (!sent && (/^\d+$/.test(f.file_id) || !f.message_id)) {
+        try {
+          const { initMTProtoClient, RENAMED_CHANNELS } = await import('../renamer');
+          const mtClient = await initMTProtoClient();
+          const targetChan = f.channel_id || (RENAMED_CHANNELS as any)[f.category];
+          if (mtClient && targetChan) {
+            const msgs = await mtClient.getMessages(targetChan, { limit: 100 });
+            const matched = msgs.find((m: any) => 
+              (m.media?.document?.id?.toString() === f.file_id) || 
+              (m.message && m.message.includes(db.cleanTitle(f.title)))
+            );
+            if (matched) {
+              db.updateFileLocation(f.file_id, targetChan.toString(), matched.id);
+              sent = await ctx.telegram.copyMessage(ctx.from.id, targetChan, matched.id, {
+                caption,
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard }
+              });
+            }
+          }
+        } catch (legacyErr) {
+          logger.error({ legacyErr }, 'Legacy MTProto resolution failed');
+        }
+      }
+
+      if (sent) {
+        sentMsgIds.push(sent.message_id);
+        await new Promise(r => setTimeout(r, 800)); // Respect rate limits
+      } else {
+        throw new Error('File delivery failed: media identifier could not be resolved');
+      }
     } catch (error: any) {
       logger.error({ err: error, file_id: f.file_id, title: f.title }, 'File delivery failed');
       if (error.response?.status === 429) {

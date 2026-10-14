@@ -92,6 +92,8 @@ async function handleIndexing(ctx: any, category: string, isScan = false) {
     overview: meta.overview,
     rating: meta.rating,
     genres: meta.genres,
+    channel_id: msg.chat?.id?.toString() || '',
+    message_id: msg.message_id || null,
   };
 
   db.addFile(fileData);
@@ -211,10 +213,19 @@ export async function scanChannel(ctx: any, category: string, limitCount = 100) 
   }
 }
 
-export async function handleUploadedRenamedMedia(uploadedMessage: any, category: string, renamedFileName: string) {
+export async function handleUploadedRenamedMedia(
+  uploadedMessage: any, 
+  category: string, 
+  renamedFileName: string, 
+  destinationChannel?: string
+) {
   try {
     const parsed = parseFilename(renamedFileName);
     const meta = await searchTMDB(parsed.title, parsed.year, category);
+
+    const docId = uploadedMessage.media?.document?.id?.toString() || `${category}_${Date.now()}`;
+    const channelId = destinationChannel ? destinationChannel.toString() : '';
+    const messageId = uploadedMessage.id || null;
 
     const fileData = {
       title: meta.title || parsed.title,
@@ -223,7 +234,7 @@ export async function handleUploadedRenamedMedia(uploadedMessage: any, category:
       quality: parsed.quality,
       season: parsed.season,
       episode: parsed.episode,
-      file_id: uploadedMessage.media?.document?.id?.toString() || `${category}_${Date.now()}`,
+      file_id: docId,
       file_name: renamedFileName,
       file_size: Number(uploadedMessage.media?.document?.size || 0),
       tags: parsed.tags,
@@ -232,10 +243,12 @@ export async function handleUploadedRenamedMedia(uploadedMessage: any, category:
       overview: meta.overview,
       rating: meta.rating,
       genres: meta.genres,
+      channel_id: channelId,
+      message_id: messageId,
     };
 
     db.addFile(fileData);
-    logger.info(`Indexed renamed upload: ${fileData.title}`);
+    logger.info(`Indexed renamed upload: ${fileData.title} (msg_id: ${messageId} in ${channelId})`);
     queueBatchAnnouncement(fileData);
   } catch (err) {
     logger.error({ err }, 'Error handling uploaded renamed media');

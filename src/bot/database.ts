@@ -163,6 +163,17 @@ export async function initDb() {
     logger.info('Migrating announcements table: adding main_msg_id column...');
     db.exec('ALTER TABLE announcements ADD COLUMN main_msg_id INTEGER');
   }
+
+  // Migration: Add channel_id and message_id to files table for robust copyMessage delivery
+  const filesCols = db.prepare("PRAGMA table_info(files)").all() as any[];
+  if (!filesCols.some(col => col.name === 'channel_id')) {
+    logger.info('Migrating files table: adding channel_id column...');
+    db.exec('ALTER TABLE files ADD COLUMN channel_id TEXT');
+  }
+  if (!filesCols.some(col => col.name === 'message_id')) {
+    logger.info('Migrating files table: adding message_id column...');
+    db.exec('ALTER TABLE files ADD COLUMN message_id INTEGER');
+  }
   
   logger.info('Database Schema Verified.');
 
@@ -214,11 +225,15 @@ export const isBanned = (id: number) => {
 export const addFile = (data: any) => {
   const stmt = db.prepare(`
     INSERT INTO files 
-    (title, year, category, quality, season, episode, file_id, file_name, file_size, tags, tmdb_id, poster_url, overview, rating, genres)
+    (title, year, category, quality, season, episode, file_id, file_name, file_size, tags, tmdb_id, poster_url, overview, rating, genres, channel_id, message_id)
     VALUES 
-    (@title, @year, @category, @quality, @season, @episode, @file_id, @file_name, @file_size, @tags, @tmdb_id, @poster_url, @overview, @rating, @genres)
+    (@title, @year, @category, @quality, @season, @episode, @file_id, @file_name, @file_size, @tags, @tmdb_id, @poster_url, @overview, @rating, @genres, @channel_id, @message_id)
   `);
-  const result = stmt.run(data);
+  const result = stmt.run({
+    ...data,
+    channel_id: data.channel_id || null,
+    message_id: data.message_id || null,
+  });
   
   // Sync to Cloud
   fsAddFile(data).catch(err => {
@@ -226,6 +241,10 @@ export const addFile = (data: any) => {
   });
   
   return result;
+};
+
+export const updateFileLocation = (fileId: string, channelId: string, messageId: number) => {
+  return db.prepare('UPDATE files SET channel_id = ?, message_id = ? WHERE file_id = ?').run(channelId, messageId, fileId);
 };
 
 export const fileExists = (title: string, quality: string, season: number | null, episode: number | null) => {

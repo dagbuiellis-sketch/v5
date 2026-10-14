@@ -111,6 +111,31 @@ async function executeRenameJob(job: RenameJob) {
   logger.info(`   Target: ${targetFileName}`);
   logger.info(`   Destination: ${destinationChannel}`);
 
+  // Telegram Bot MTProto upload limit is 2,000 MB (upload.SaveBigFilePart limit)
+  const MAX_BOT_UPLOAD_BYTES = 2000 * 1024 * 1024;
+  if (job.fileSize > MAX_BOT_UPLOAD_BYTES) {
+    const sizeMB = (job.fileSize / (1024 * 1024)).toFixed(1);
+    logger.warn(`⚠️ File "${job.originalFileName}" (${sizeMB} MB) exceeds Telegram's 2,000 MB bot re-upload limit.`);
+    logger.info(`⏩ Forwarding message directly to ${destinationChannel} to preserve file without upload limit...`);
+
+    try {
+      const forwardedMsgs = await mtClient.forwardMessages(destinationChannel, {
+        messages: [job.sourceMessageId],
+        fromPeer: job.sourceChannelId,
+      });
+
+      const forwardedMsg = forwardedMsgs?.[0];
+      if (forwardedMsg) {
+        const { handleUploadedRenamedMedia } = await import('./handlers/indexer');
+        await handleUploadedRenamedMedia(forwardedMsg, job.category, targetFileName, destinationChannel);
+        logger.info(`✅ Successfully forwarded & indexed oversized file: ${targetFileName}`);
+      }
+    } catch (fwdErr) {
+      logger.error({ fwdErr }, `Failed to forward oversized file: ${job.originalFileName}`);
+    }
+    return;
+  }
+
   // Create temporary directory on disk
   const tempDir = path.join(os.tmpdir(), 'vinehill_cache');
   if (!fs.existsSync(tempDir)) {
@@ -166,11 +191,11 @@ async function executeRenameJob(job: RenameJob) {
       },
     });
 
-    logger.info(`🎉 File successfully renamed and re-uploaded to ${destinationChannel}!`);
+    logger.info(`🎉 File successfully renamed and re-uploaded to ${destinationChannel} (Message ID: ${uploadedMessage.id})!`);
 
     // 4. Pass the newly uploaded media to the indexer so it announces and indexes from the renamed channel
     const { handleUploadedRenamedMedia } = await import('./handlers/indexer');
-    await handleUploadedRenamedMedia(uploadedMessage, job.category, targetFileName);
+    await handleUploadedRenamedMedia(uploadedMessage, job.category, targetFileName, destinationChannel);
 
   } catch (err) {
     logger.error({ err }, `Pipeline failed for ${job.originalFileName}`);
