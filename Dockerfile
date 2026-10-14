@@ -17,6 +17,9 @@ COPY . .
 # Build Vite frontend and server bundle
 RUN npm run build
 
+# Ensure persistent data directory exists with write permissions
+RUN mkdir -p /app/data && chmod 777 /app/data
+
 # Expose web dashboard port
 EXPOSE 3000
 

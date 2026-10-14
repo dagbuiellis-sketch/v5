@@ -58,7 +58,7 @@ async function handleIndexing(ctx: any, category: string, isScan = false) {
   const media = msg.document || msg.video || msg.audio;
   if (!media) return;
 
-  const fileName = media.file_name || `${category}_file`;
+  const fileName = media.file_name || msg.caption || `${category}_file`;
   const fileSize = media.file_size || 0;
   const fileId = media.file_id;
 
@@ -262,11 +262,12 @@ export function registerIndexer() {
     if (rawCategory) {
       const media = post.document || post.video || post.audio;
       if (media && ['movies', 'series', 'anime'].includes(rawCategory)) {
-        logger.info(`📥 Raw file detected in staging channel (${rawCategory}): ${media.file_name || 'unnamed'}`);
+        const detectedName = media.file_name || post.caption || `${rawCategory}_file`;
+        logger.info(`📥 Raw file detected in staging channel (${rawCategory}): ${detectedName}`);
         queueRenameJob({
           sourceChannelId: channelId,
           sourceMessageId: post.message_id,
-          originalFileName: media.file_name || `${rawCategory}_file`,
+          originalFileName: detectedName,
           fileSize: media.file_size || 0,
           category: rawCategory,
         });

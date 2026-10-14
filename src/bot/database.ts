@@ -10,19 +10,42 @@ const logger = pino({
   },
 });
 
-const dataDir = process.env.DATA_DIR || path.join(process.cwd(), 'data');
-if (!fs.existsSync(dataDir)) {
+function cleanEnvPath(val?: string): string {
+  if (!val) return '';
+  return val.trim().replace(/^["']|["']$/g, '').trim();
+}
+
+const rawDbPath = cleanEnvPath(process.env.DB_PATH);
+const rawDataDir = cleanEnvPath(process.env.DATA_DIR);
+
+let finalDbPath: string;
+if (rawDbPath) {
+  finalDbPath = path.isAbsolute(rawDbPath) ? rawDbPath : path.resolve(process.cwd(), rawDbPath);
+} else if (rawDataDir) {
+  finalDbPath = path.isAbsolute(rawDataDir) ? path.join(rawDataDir, 'vinehill.db') : path.resolve(process.cwd(), rawDataDir, 'vinehill.db');
+} else {
+  finalDbPath = path.resolve(process.cwd(), 'data', 'vinehill.db');
+}
+
+const dbDir = path.dirname(finalDbPath);
+if (!fs.existsSync(dbDir)) {
   try {
-    fs.mkdirSync(dataDir, { recursive: true });
+    fs.mkdirSync(dbDir, { recursive: true });
+    logger.info(`Created database directory at: ${dbDir}`);
   } catch (err) {
-    logger.warn({ err }, 'Failed to create data directory');
+    logger.error({ err, dbDir }, 'Failed to create database directory');
   }
 }
 
-const DB_PATH = process.env.DB_PATH || path.join(dataDir, 'vinehill.db');
+if (fs.existsSync(finalDbPath) && fs.statSync(finalDbPath).isDirectory()) {
+  logger.warn(`Configured DB_PATH ${finalDbPath} is a directory! Using ${path.join(finalDbPath, 'vinehill.db')} instead.`);
+  finalDbPath = path.join(finalDbPath, 'vinehill.db');
+}
+
+logger.info(`Connecting SQLite database at: ${finalDbPath}`);
 
 // Ensure DB exists
-export const db = new Database(DB_PATH);
+export const db = new Database(finalDbPath);
 db.pragma('journal_mode = WAL');
 db.pragma('busy_timeout = 5000');
 
@@ -124,6 +147,13 @@ export async function initDb() {
 
     CREATE INDEX IF NOT EXISTS idx_files_title ON files(title);
     CREATE INDEX IF NOT EXISTS idx_files_category ON files(category);
+    CREATE INDEX IF NOT EXISTS idx_files_category_title ON files(category, title);
+    CREATE INDEX IF NOT EXISTS idx_files_added_at ON files(added_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_files_lookup ON files(title, quality, season, episode);
+    CREATE INDEX IF NOT EXISTS idx_deliveries_pending_delete ON deliveries(deleted, delete_at);
+    CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id);
+    CREATE INDEX IF NOT EXISTS idx_likes_user ON likes(user_id);
+    CREATE INDEX IF NOT EXISTS idx_search_history_user ON search_history(user_id);
   `);
 
   // Migration: Add main_msg_id if missing from announcements

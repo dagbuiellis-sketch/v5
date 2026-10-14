@@ -35,28 +35,41 @@ export const db = initializeFirestore(app, {
 export let isUsingAdmin = false;
 export let adminDb: any = null;
 
-// Try to initialize Firebase Admin SDK using Service Account
-const serviceAccountEnv = process.env.FIREBASE_SERVICE_ACCOUNT;
-if (serviceAccountEnv && !serviceAccountEnv.includes('...')) {
-  try {
-    let serviceAccount;
-    if (serviceAccountEnv.trim().startsWith('{')) {
-      serviceAccount = JSON.parse(serviceAccountEnv);
-    } else {
-      serviceAccount = JSON.parse(Buffer.from(serviceAccountEnv, 'base64').toString('utf8'));
-    }
-
-    const adminApp = admin.apps.length === 0 
-      ? admin.initializeApp({ credential: admin.credential.cert(serviceAccount) })
-      : admin.apps[0];
-    
-    const dbId = firebaseConfig.firestoreDatabaseId;
-    adminDb = dbId ? getAdminFirestore(adminApp, dbId) : getAdminFirestore(adminApp);
-    isUsingAdmin = true;
-    logger.info('🛡️ Firebase Admin SDK initialized successfully using Service Account.');
-  } catch (err) {
-    logger.error({ err }, '⚠️ Failed to initialize Firebase Admin SDK. Falling back to Client SDK...');
+// Try to initialize Firebase Admin SDK using Service Account (optional)
+const rawServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT;
+if (rawServiceAccount) {
+  let cleaned = rawServiceAccount.trim();
+  // Strip surrounding quotes if docker-compose env_file preserved them
+  if ((cleaned.startsWith("'") && cleaned.endsWith("'")) || (cleaned.startsWith('"') && cleaned.endsWith('"'))) {
+    cleaned = cleaned.slice(1, -1).trim();
   }
+
+  // Check if it's not a placeholder
+  if (cleaned && !cleaned.includes('...') && cleaned.length > 20) {
+    try {
+      let serviceAccount;
+      if (cleaned.startsWith('{')) {
+        serviceAccount = JSON.parse(cleaned);
+      } else {
+        serviceAccount = JSON.parse(Buffer.from(cleaned, 'base64').toString('utf8'));
+      }
+
+      const adminApp = admin.apps.length === 0 
+        ? admin.initializeApp({ credential: admin.credential.cert(serviceAccount) })
+        : admin.apps[0];
+      
+      const dbId = firebaseConfig.firestoreDatabaseId;
+      adminDb = dbId ? getAdminFirestore(adminApp, dbId) : getAdminFirestore(adminApp);
+      isUsingAdmin = true;
+      logger.info('🛡️ Firebase Admin SDK initialized successfully using Service Account.');
+    } catch (err: any) {
+      logger.warn({ message: err?.message }, '⚠️ Notice: Firebase Admin Service Account not configured or invalid JSON. Running in standalone SQLite mode.');
+    }
+  } else {
+    logger.info('ℹ️ Standalone Mode: Running with local persistent SQLite database (Firebase Service Account not set).');
+  }
+} else {
+  logger.info('ℹ️ Standalone Mode: Running with local persistent SQLite database (No Firebase Service Account provided).');
 }
 
 // Client SDK Auth cache
