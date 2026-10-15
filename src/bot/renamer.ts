@@ -68,6 +68,7 @@ export interface RenameJob {
   category: 'movies' | 'series' | 'anime' | string;
   isCancelled?: boolean;
   progressMsgId?: number;
+  targetChannelId?: string;
   adminChatId?: string | number;
 }
 
@@ -133,6 +134,8 @@ async function executeRenameJob(job: RenameJob) {
     return;
   }
 
+  job.targetChannelId = destinationChannel;
+
   const parsed = parseFilename(job.originalFileName);
   const targetFileName = formatRenamedFilename(parsed, job.originalFileName);
 
@@ -141,40 +144,36 @@ async function executeRenameJob(job: RenameJob) {
   logger.info(`   Target: ${targetFileName}`);
   logger.info(`   Destination: ${destinationChannel}`);
 
-  // Admin live progress notification
-  const adminId = getAdminId();
+  // Channel live progress notification so channel admins/friends can monitor and cancel
   let progressMsgId: number | null = null;
   let lastProgressEditTime = 0;
   const PROGRESS_THROTTLE_MS = 2500;
   const sizeMB = (job.fileSize / (1024 * 1024)).toFixed(1);
 
-  if (adminId) {
-    try {
-      const initialText =
-        `⚡ <b>Downloading & Renaming Media</b>\n\n` +
-        `📁 <b>File:</b> <code>${job.originalFileName}</code>\n` +
-        `🏷 <b>Target:</b> <code>${targetFileName}</code>\n` +
-        `📦 <b>Size:</b> ${sizeMB} MB | <b>Category:</b> ${job.category}\n` +
-        `⏳ <b>Status:</b> Initializing download...`;
+  try {
+    const initialText =
+      `⚡ <b>Downloading & Renaming Media</b>\n\n` +
+      `📁 <b>File:</b> <code>${job.originalFileName}</code>\n` +
+      `🏷 <b>Target:</b> <code>${targetFileName}</code>\n` +
+      `📦 <b>Size:</b> ${sizeMB} MB | <b>Category:</b> ${job.category}\n` +
+      `⏳ <b>Status:</b> Initializing download...`;
 
-      const sent = await bot.telegram.sendMessage(adminId, initialText, {
-        parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '🛑 Cancel Download & Rename', callback_data: `cancel_rename:${job.id}` }]
-          ]
-        }
-      });
-      progressMsgId = sent.message_id;
-      job.progressMsgId = progressMsgId;
-      job.adminChatId = adminId;
-    } catch (notifyErr) {
-      logger.debug({ notifyErr }, 'Could not send initial progress message to admin');
-    }
+    const sent = await bot.telegram.sendMessage(destinationChannel, initialText, {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🛑 Cancel Download & Rename', callback_data: `cancel_rename:${job.id}` }]
+        ]
+      }
+    });
+    progressMsgId = sent.message_id;
+    job.progressMsgId = progressMsgId;
+  } catch (notifyErr) {
+    logger.debug({ notifyErr, destinationChannel }, 'Could not send initial progress message to channel');
   }
 
-  const updateAdminProgress = async (statusText: string, force = false, showButton = true) => {
-    if (!adminId || !progressMsgId) return;
+  const updateChannelProgress = async (statusText: string, force = false, showButton = true) => {
+    if (!destinationChannel || !progressMsgId) return;
     const now = Date.now();
     if (!force && now - lastProgressEditTime < PROGRESS_THROTTLE_MS) return;
     lastProgressEditTime = now;
@@ -196,7 +195,7 @@ async function executeRenameJob(job: RenameJob) {
     }
 
     try {
-      await bot.telegram.editMessageText(adminId, progressMsgId, undefined, text, extra);
+      await bot.telegram.editMessageText(destinationChannel, progressMsgId, undefined, text, extra);
     } catch {
       // Ignore Telegram rate limit or unedited text errors
     }
@@ -222,27 +221,38 @@ async function executeRenameJob(job: RenameJob) {
         await handleUploadedRenamedMedia(forwardedMsg, job.category, targetFileName, destinationChannel);
         logger.info(`✅ Successfully forwarded & indexed oversized file: ${targetFileName}`);
 
-        if (adminId && progressMsgId) {
+        if (destinationChannel && progressMsgId) {
           bot.telegram.editMessageText(
-            adminId,
+            destinationChannel,
             progressMsgId,
             undefined,
-            `✅ <b>Oversized File Forwarded & Indexed!</b>\n\n🏷 <b>File:</b> <code>${targetFileName}</code>\n📢 <b>Destination:</b> ${destinationChannel}`,
+            `✅ <b>Oversized File Forwarded & Indexed!</b>\n\n` +
+            `🏷 <b>File:</b> <code>${targetFileName}</code>\n` +
+            `📢 <b>Destination:</b> ${destinationChannel}\n\n` +
+            `<i>⏱ Status message will auto-delete in 10s...</i>`,
             { parse_mode: 'HTML' }
           ).catch(() => {});
+
+          setTimeout(() => {
+            bot.telegram.deleteMessage(destinationChannel, progressMsgId!).catch(() => {});
+          }, 10000);
         }
       }
     } catch (fwdErr: any) {
       if (fwdErr?.message === 'CANCELED_BY_ADMIN' || job.isCancelled) {
         logger.warn(`🛑 Oversized forward for "${job.originalFileName}" was cancelled.`);
-        if (adminId && progressMsgId) {
+        if (destinationChannel && progressMsgId) {
           bot.telegram.editMessageText(
-            adminId,
+            destinationChannel,
             progressMsgId,
             undefined,
-            `🛑 <b>Download & Rename Cancelled</b>\n\n📁 File: <code>${job.originalFileName}</code>\n📋 Remaining queue: <b>${renameQueue.length}</b> job(s) intact.`,
+            `🛑 <b>Download & Rename Cancelled</b>\n\n📁 File: <code>${job.originalFileName}</code>\n📋 Remaining queue: <b>${renameQueue.length}</b> job(s) intact.\n\n<i>⏱ Status message will auto-delete in 10s...</i>`,
             { parse_mode: 'HTML' }
           ).catch(() => {});
+
+          setTimeout(() => {
+            bot.telegram.deleteMessage(destinationChannel, progressMsgId!).catch(() => {});
+          }, 10000);
         }
       } else {
         logger.error({ fwdErr }, `Failed to forward oversized file: ${job.originalFileName}`);
@@ -289,7 +299,7 @@ async function executeRenameJob(job: RenameJob) {
         if (percent >= lastLoggedPercent + 20 || percent === 100) {
           lastLoggedPercent = percent;
           logger.info(`   Download progress: ${percent}%`);
-          updateAdminProgress(`📥 Downloading from storage: <b>${percent}%</b>`);
+          updateChannelProgress(`📥 Downloading from storage: <b>${percent}%</b>`);
         }
       }) as any,
     });
@@ -297,7 +307,7 @@ async function executeRenameJob(job: RenameJob) {
     if (job.isCancelled) throw new Error('CANCELED_BY_ADMIN');
 
     logger.info(`✅ Download complete. Preparing upload as "${targetFileName}"...`);
-    await updateAdminProgress(`⚙️ Download complete. Uploading as <code>${targetFileName}</code>...`, true);
+    await updateChannelProgress(`⚙️ Download complete. Uploading as <code>${targetFileName}</code>...`, true);
 
     // 3. Upload to target channel with the new filename and formatted caption
     const yearStr = parsed.year ? ` (${parsed.year})` : '';
@@ -318,7 +328,7 @@ async function executeRenameJob(job: RenameJob) {
         if (percent >= lastUploadPercent + 20 || percent === 100) {
           lastUploadPercent = percent;
           logger.info(`   Upload progress: ${percent}%`);
-          updateAdminProgress(`📤 Uploading to ${destinationChannel}: <b>${percent}%</b>`);
+          updateChannelProgress(`📤 Uploading to ${destinationChannel}: <b>${percent}%</b>`);
         }
       },
     });
@@ -331,41 +341,55 @@ async function executeRenameJob(job: RenameJob) {
     const { handleUploadedRenamedMedia } = await import('./handlers/indexer');
     await handleUploadedRenamedMedia(uploadedMessage, job.category, targetFileName, destinationChannel);
 
-    if (adminId && progressMsgId) {
+    if (destinationChannel && progressMsgId) {
       bot.telegram.editMessageText(
-        adminId,
+        destinationChannel,
         progressMsgId,
         undefined,
         `✅ <b>Download & Rename Complete!</b>\n\n` +
         `🏷 <b>File:</b> <code>${targetFileName}</code>\n` +
         `📢 <b>Destination:</b> ${destinationChannel}\n` +
-        `🤡 Media indexed and queued for announcement.`,
+        `🤡 Media indexed and queued for announcement.\n\n` +
+        `<i>⏱ Status message will auto-delete in 10s...</i>`,
         { parse_mode: 'HTML' }
       ).catch(() => {});
+
+      setTimeout(() => {
+        bot.telegram.deleteMessage(destinationChannel, progressMsgId!).catch(() => {});
+      }, 10000);
     }
 
   } catch (err: any) {
     if (err?.message === 'CANCELED_BY_ADMIN' || job.isCancelled) {
-      logger.warn(`🛑 Job ${job.id} for "${job.originalFileName}" was cancelled by admin.`);
-      if (adminId && progressMsgId) {
+      logger.warn(`🛑 Job ${job.id} for "${job.originalFileName}" was cancelled.`);
+      if (destinationChannel && progressMsgId) {
         const remainingCount = renameQueue.length;
         const cancelText =
           `🛑 <b>Download & Rename Cancelled</b>\n\n` +
           `📁 <b>File:</b> <code>${job.originalFileName}</code>\n` +
           `🧹 Temporary cache cleared immediately.\n` +
-          `📋 Remaining queue: <b>${remainingCount}</b> job(s) intact.`;
-        bot.telegram.editMessageText(adminId, progressMsgId, undefined, cancelText, { parse_mode: 'HTML' }).catch(() => {});
+          `📋 Remaining queue: <b>${remainingCount}</b> job(s) intact.\n\n` +
+          `<i>⏱ Status message will auto-delete in 10s...</i>`;
+        bot.telegram.editMessageText(destinationChannel, progressMsgId, undefined, cancelText, { parse_mode: 'HTML' }).catch(() => {});
+
+        setTimeout(() => {
+          bot.telegram.deleteMessage(destinationChannel, progressMsgId!).catch(() => {});
+        }, 10000);
       }
     } else {
       logger.error({ err }, `Pipeline failed for ${job.originalFileName}`);
-      if (adminId && progressMsgId) {
+      if (destinationChannel && progressMsgId) {
         bot.telegram.editMessageText(
-          adminId,
+          destinationChannel,
           progressMsgId,
           undefined,
-          `❌ <b>Download & Rename Failed</b>\n\n📁 File: <code>${job.originalFileName}</code>\n⚠️ Error: <code>${err?.message || 'Unknown error'}</code>`,
+          `❌ <b>Download & Rename Failed</b>\n\n📁 File: <code>${job.originalFileName}</code>\n⚠️ Error: <code>${err?.message || 'Unknown error'}</code>\n\n<i>⏱ Status message will auto-delete in 10s...</i>`,
           { parse_mode: 'HTML' }
         ).catch(() => {});
+
+        setTimeout(() => {
+          bot.telegram.deleteMessage(destinationChannel, progressMsgId!).catch(() => {});
+        }, 10000);
       }
     }
   } finally {

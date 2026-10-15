@@ -125,18 +125,50 @@ export function registerDownload() {
 
   // Callback for selecting an episode or downloading all
   bot.action(/^ep:([^:]+):([^:]+):([^:]+):(.+)$/, async (ctx) => {
-    const action = ctx.match[1]; // 'one' or 'all'
+    const action = ctx.match[1]; // 'one', 'all', or 'all_seasons'
     const category = ctx.match[2];
     const encodedPayload = ctx.match[4];
     const params = ctx.match[3].split(','); // [season, episode]
 
-    await ctx.answerCbQuery(action === 'all' ? '🚀 Preparing Season Batch...' : '🍿 Fetching Episode...');
+    await ctx.answerCbQuery(
+      action === 'all_seasons'
+        ? '📦 Preparing All Seasons Batch...'
+        : action === 'all'
+          ? '🚀 Preparing Season Batch...'
+          : '🍿 Fetching Episode...'
+    );
 
     const sanitized = encodedPayload.replace(/-/g, '+').replace(/_/g, '/');
     const payload = Buffer.from(sanitized, 'base64').toString('ascii');
     const [_, title] = payload.split(':');
 
-    if (action === 'all') {
+    if (action === 'all_seasons') {
+      let files = db.getAllSeriesFiles(title, category);
+      if (files.length === 0) {
+        const alt = db.findAlternativeMedia(title, category);
+        if (alt.length > 0) files = alt;
+      }
+      if (files.length === 0) {
+        return await handleDownloadFailure(ctx, `${title} All Seasons`, category, encodedPayload, `No episodes found for series ${title}`);
+      }
+
+      const seasonCount = new Set(files.map((f: any) => f.season).filter((s: any) => s !== null && s !== undefined)).size;
+      const noticeMsg = await ctx.reply(
+        `📦 <b>Preparing All Seasons Batch...</b>\n\n` +
+        `📺 <b>Series:</b> <b>${db.cleanTitle(title).toUpperCase()}</b>\n` +
+        `📂 <b>Found:</b> ${files.length} episode(s) across ${seasonCount} season(s)\n` +
+        `⚡ Sending files sequentially...`,
+        { parse_mode: 'HTML' }
+      ).catch(() => null);
+
+      await sendMediaBatch(ctx, files, encodedPayload, `${title} All Seasons`, category);
+
+      if (noticeMsg) {
+        setTimeout(() => {
+          ctx.telegram.deleteMessage(ctx.chat.id, noticeMsg.message_id).catch(() => {});
+        }, 10000);
+      }
+    } else if (action === 'all') {
       const season = parseInt(params[0]);
       let files = db.getSeasonFiles(title, season, category);
       if (files.length === 0) {
@@ -377,6 +409,7 @@ async function showEpisodePicker(ctx: any, title: string, season: number, catego
   if (row.length > 0) buttons.push(row);
 
   buttons.push([{ text: '🚀 Download Full Season', callback_data: `ep:all:${category}:${season},0:${encodedPayload}` }]);
+  buttons.push([{ text: '📦 Download All Seasons', callback_data: `ep:all_seasons:${category}:0,0:${encodedPayload}` }]);
   buttons.push([{ text: '⬅️ Back to Seasons', callback_data: `chk:${encodedPayload}` }]);
 
   const cleanedTitle = db.cleanTitle(title);
@@ -405,6 +438,7 @@ async function showSeasonPicker(ctx: any, title: string, seasons: number[], cate
   }
   if (row.length > 0) buttons.push(row);
 
+  buttons.push([{ text: '📦 Download All Seasons', callback_data: `ep:all_seasons:${category}:0,0:${encodedPayload}` }]);
   buttons.push([{ text: '🤡 Back to Search', callback_data: 'nav:search' }]);
 
   const messageText = `🤡 <b>${cleanedTitle.toUpperCase()}</b>\n\nThis is a <b>${category}</b>. Please select a season to view episodes:`;

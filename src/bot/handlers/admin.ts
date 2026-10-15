@@ -536,15 +536,36 @@ export function registerAdmin() {
 
   // Cancel ongoing download & rename pipeline via inline button
   bot.action(/^cancel_rename:(.+)$/, async (ctx) => {
-    if (ctx.from.id.toString() !== getAdminId()) {
-      return ctx.answerCbQuery('Forbidden', { show_alert: true });
-    }
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    let isAuthorized = userId.toString() === getAdminId();
     const jobId = ctx.match[1];
-    const { cancelActiveRenameJob, getActiveRenameJob } = await import('../renamer');
+    const { cancelActiveRenameJob, getActiveRenameJob, RENAMED_CHANNELS } = await import('../renamer');
     const active = getActiveRenameJob();
+
+    if (!isAuthorized && active) {
+      const channelTarget = active.targetChannelId || RENAMED_CHANNELS[active.category];
+      if (channelTarget) {
+        try {
+          const member = await ctx.telegram.getChatMember(channelTarget, userId);
+          if (['creator', 'administrator'].includes(member.status)) {
+            isAuthorized = true;
+          }
+        } catch {
+          // Fall back if permission query unavailable
+        }
+      }
+    }
+
+    if (!isAuthorized) {
+      return ctx.answerCbQuery('⚠️ Only channel administrators and the bot owner can cancel this task.', { show_alert: true });
+    }
+
     if (!active) {
       return ctx.answerCbQuery('ℹ️ No active download or rename process running.', { show_alert: true });
     }
+
     const cancelled = cancelActiveRenameJob(jobId);
     if (cancelled) {
       await ctx.answerCbQuery('🛑 Cancelling download & rename...', { show_alert: true });

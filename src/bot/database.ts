@@ -317,6 +317,14 @@ export const getSeasonFiles = (title: string, season: number, category: string) 
   `).all(title, season, category) as any[];
 };
 
+export const getAllSeriesFiles = (title: string, category: string) => {
+  return db.prepare(`
+    SELECT * FROM files 
+    WHERE title = ? AND category = ? AND file_id IS NOT NULL AND file_id != ''
+    ORDER BY season ASC, episode ASC
+  `).all(title, category) as any[];
+};
+
 export const checkSeriesGaps = (title: string, category: string) => {
   const seasons = getSeriesSeasons(title, category);
   const gaps: { season: number, missing: number[] }[] = [];
