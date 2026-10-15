@@ -41,59 +41,21 @@ export function setupBot() {
 }
 
 /**
- * Safely react to a message with an emoji (e.g. 🤡) with playful big animation.
- * Attempts native MTProto client first (Api.messages.SendReaction with big: true, which is the
- * exact protocol official Telegram apps use when users manually tap reactions), and falls back to
- * Telegraf Bot API with boolean is_big: true.
+ * Safely react to a message with an emoji (e.g. 🤡)
+ * Works across Telegram Bot API versions without failing if permissions are absent
  */
-export async function setMessageReaction(
-  telegram: any,
-  chatId: string | number,
-  messageId: number,
-  emoji = '🤡',
-  isBig = true
-) {
-  let mtSuccess = false;
-
-  // 1. Primary: Use MTProto SendReaction with big: true for native playful animations
+export async function setMessageReaction(telegram: any, chatId: string | number, messageId: number, emoji = '🤡') {
   try {
-    const { initMTProtoClient } = await import('./renamer');
-    const { Api } = await import('telegram');
-    const mtClient = await initMTProtoClient();
-    if (mtClient) {
-      await mtClient.invoke(
-        new Api.messages.SendReaction({
-          peer: chatId,
-          msgId: messageId,
-          reaction: [new Api.ReactionEmoji({ emoticon: emoji })],
-          big: isBig,
-          addToRecent: true,
-        })
-      );
-      mtSuccess = true;
-      logger.info({ chatId, messageId, emoji, isBig }, '✨ Native MTProto big reaction applied successfully');
-    }
-  } catch (mtErr: any) {
-    logger.debug({ err: mtErr?.message, chatId, messageId }, 'MTProto reaction attempt failed, falling back to Bot API');
-  }
-
-  if (mtSuccess) return;
-
-  // 2. Fallback: Telegram Bot API with strict boolean is_big
-  try {
-    if (typeof telegram.callApi === 'function') {
+    if (typeof telegram.setMessageReaction === 'function') {
+      await telegram.setMessageReaction(chatId, messageId, [{ type: 'emoji', emoji }]);
+    } else {
       await (telegram as any).callApi('setMessageReaction', {
         chat_id: chatId,
         message_id: messageId,
         reaction: [{ type: 'emoji', emoji }],
-        is_big: Boolean(isBig),
       });
-      logger.info({ chatId, messageId, emoji }, 'Bot API reaction applied');
-    } else if (typeof telegram.setMessageReaction === 'function') {
-      await telegram.setMessageReaction(chatId, messageId, [{ type: 'emoji', emoji }], Boolean(isBig));
-      logger.info({ chatId, messageId, emoji }, 'Bot API reaction applied');
     }
   } catch (err: any) {
-    logger.warn({ err: err?.message, chatId, messageId }, 'Reaction call skipped or failed');
+    logger.debug({ err: err?.message, chatId, messageId }, 'Reaction call skipped or failed');
   }
 }

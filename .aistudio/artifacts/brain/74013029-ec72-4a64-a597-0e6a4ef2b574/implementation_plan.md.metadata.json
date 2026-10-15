@@ -1,6 +1,6 @@
 {
-  "summary": "Implementation plan to resolve the clown reaction animation by implementing native MTProto messages.SendReaction with big: true flag, fixing Telegraf Bot API boolean parameters, and adding detailed diagnostic logging.",
-  "updatedAt": "2026-10-15T20:32:08.345454396Z",
+  "summary": "Implementation plan to defer the clown emoji reaction during series and anime downloads so that only the final delivered file receives the clown reaction 1 second after receipt.",
+  "updatedAt": "2026-10-15T20:02:58.618790441Z",
   "requestFeedback": true,
   "userFacing": true
 }

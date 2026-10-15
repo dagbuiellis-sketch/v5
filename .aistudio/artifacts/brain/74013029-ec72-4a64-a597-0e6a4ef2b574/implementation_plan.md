@@ -1,51 +1,33 @@
-# Implementation Plan: Fix Playful Animated Clown Reaction
+# Implementation Plan: Target Clown Reaction to Final Series File
 
-## 1. Root Cause Analysis
-1. **Telegram Client Animation vs. Bot API Limitations**:
-   - When a human user manually reacts to a message in the Telegram app, the local client renders an animated Lottie burst on the screen.
-   - In standard Bot API (`setMessageReaction`), Telegram receives the reaction and attaches the badge, but many Telegram clients (iOS, Android, Desktop) do not trigger full-screen burst animations for bot-applied reactions or in channels unless MTProto `big: true` flags are sent through the client protocol.
-2. **Telegraf vs. Telegram Bot API Parameter Formatting**:
-   - Telegraf's `setMessageReaction(chat_id, message_id, reaction, is_big)` takes a raw boolean `true` as its 4th argument. If passed an object `{ is_big: true }`, Telegraf serializes it as an object rather than a boolean, causing the Bot API to ignore the animation flag.
-3. **Missing MTProto Native Reaction Route**:
-   - The bot has an active GramJS MTProto client (`initMTProtoClient()`). MTProto supports `Api.messages.SendReaction({ peer, msgId, reaction: [new Api.ReactionEmoji({ emoticon: '🤡' })], big: true, addToRecent: true })`, which is the exact call Telegram client apps use when humans react.
+## 1. Overview
+Currently, in `sendMediaBatch` within `src/bot/handlers/download.ts`, every delivered episode in a multi-file batch (e.g., full seasons or all seasons) triggers an individual clown emoji (`🤡`) reaction 1 second after delivery.
+As requested, for series (both TV Series and Anime), the clown reaction should be applied **only to the last file received by the user**. If a single episode is downloaded, that episode is the last (and only) file and will still receive the reaction.
 
 ---
 
 ## 2. Proposed Changes
 
-### `src/bot/client.ts`
-1. **Implement Dual-Route MTProto & Bot API Reaction Pipeline**:
-   - First attempt native MTProto reaction using GramJS `Api.messages.SendReaction`:
-     ```typescript
-     import { Api } from 'telegram';
-     import { initMTProtoClient } from './renamer';
-
-     const mtClient = await initMTProtoClient();
-     if (mtClient) {
-       await mtClient.invoke(new Api.messages.SendReaction({
-         peer: chatId,
-         msgId: messageId,
-         reaction: [new Api.ReactionEmoji({ emoticon: emoji })],
-         big: true,
-         addToRecent: true
-       }));
-     }
-     ```
-   - Fall back to Telegraf Bot API with strict boolean types:
-     ```typescript
-     await (telegram as any).callApi('setMessageReaction', {
-       chat_id: chatId,
-       message_id: messageId,
-       reaction: [{ type: 'emoji', emoji }],
-       is_big: true,
-     });
-     ```
-2. **Enhanced Diagnostics**:
-   - Promote error logging from hidden `logger.debug` to `logger.warn` with descriptive diagnostic details if Telegram returns a code (e.g., `REACTION_INVALID`, `CHAT_NOT_MODIFIED`).
+### `src/bot/handlers/download.ts`
+1. **Differentiate Reaction Logic in `sendMediaBatch`**:
+   - Detect if the current batch is episodic (`series` or `anime` category).
+   - In the file delivery loop:
+     - Record all successfully sent messages into `sentMsgIds`.
+     - For non-series media (such as movies), continue applying the reaction or let the batch defer to the last file.
+     - For `series` and `anime`, suppress per-file intermediate reactions during the loop.
+   - After the delivery loop completes:
+     - Identify the last successfully delivered message (`sentMsgIds[sentMsgIds.length - 1]`).
+     - Schedule the `🤡` reaction via `setMessageReaction(ctx.telegram, ctx.from.id, lastSentMsgId, '🤡')` with the 1-second delay (`setTimeout(..., 1000)`).
+   - Ensure that in single-episode downloads (where `sentMsgIds.length === 1`), that single episode receives the reaction exactly as intended.
+   - In 429 retry edge-cases, maintain the same rule: intermediate files are not reacted, and only the final delivered file in the sequence gets the clown reaction.
 
 ---
 
 ## 3. Verification Plan
-1. **Type & Syntax Checking**: Run `lint_applet` (`tsc --noEmit`) to verify zero TypeScript errors.
-2. **Compilation Verification**: Run `compile_applet` to confirm clean build.
-3. **Execution Verification**: Verify that reactions call MTProto `SendReaction` with `big: true` and fall back cleanly to Bot API `is_big: true`.
+1. **Static Analysis & Compilation**:
+   - Run `lint_applet` (`tsc --noEmit`) to verify clean TypeScript compilation.
+   - Run `compile_applet` to verify build integrity.
+2. **Behavioral Verification**:
+   - Test full season / all seasons batch delivery: verify only the last episode message receives `🤡` after 1 second.
+   - Test single episode delivery: verify that the single episode receives `🤡` after 1 second.
+   - Test movie file delivery: verify movies continue to receive the `🤡` reaction.
