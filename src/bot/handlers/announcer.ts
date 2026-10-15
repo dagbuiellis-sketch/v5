@@ -131,6 +131,12 @@ async function _doAnnounce(f: any) {
   }
 }
 
+function scheduleClownReaction(telegram: any, chatId: string | number, messageId: number, delayMs = 1000) {
+  setTimeout(() => {
+    setMessageReaction(telegram, chatId, messageId, '🤡').catch(() => {});
+  }, delayMs);
+}
+
 async function _announceMovie(f: any) {
   const channel = PUBLIC_CHANNELS.movies;
   if (!channel) return;
@@ -150,7 +156,7 @@ async function _announceMovie(f: any) {
     parse_mode: 'HTML',
     ...keyboard
   });
-  setMessageReaction(bot.telegram, channel, sent.message_id, '🤡').catch(() => {});
+  scheduleClownReaction(bot.telegram, channel, sent.message_id, 1000);
 
   // Cross-post to Main
   let mainMsgId = null;
@@ -159,7 +165,7 @@ async function _announceMovie(f: any) {
       reply_markup: keyboard.reply_markup
     });
     mainMsgId = copied.message_id;
-    setMessageReaction(bot.telegram, PUBLIC_CHANNELS.main, copied.message_id, '🤡').catch(() => {});
+    scheduleClownReaction(bot.telegram, PUBLIC_CHANNELS.main, copied.message_id, 1000);
   }
   db.saveAnnouncementInfo(f.title, f.category, sent.message_id, mainMsgId, channel);
 }
@@ -175,7 +181,7 @@ async function _announceGame(f: any) {
     parse_mode: 'HTML',
     ...keyboard
   });
-  setMessageReaction(bot.telegram, channel, sent.message_id, '🤡').catch(() => {});
+  scheduleClownReaction(bot.telegram, channel, sent.message_id, 1000);
 
   db.saveAnnouncementInfo(f.title, f.category, sent.message_id, null, channel);
 }
@@ -191,13 +197,13 @@ async function _announceSeries(f: any) {
     // Finished show: Post fresh
     const { caption, keyboard } = _buildSeriesCaption(f, false);
     const sent = await bot.telegram.sendPhoto(channel, f.poster_url, { caption, parse_mode: 'HTML', ...keyboard });
-    setMessageReaction(bot.telegram, channel, sent.message_id, '🤡').catch(() => {});
+    scheduleClownReaction(bot.telegram, channel, sent.message_id, 1000);
     
     let mainMsgId = null;
     if (PUBLIC_CHANNELS.main) {
       const copied = await bot.telegram.copyMessage(PUBLIC_CHANNELS.main, channel, sent.message_id, { reply_markup: keyboard.reply_markup });
       mainMsgId = copied.message_id;
-      setMessageReaction(bot.telegram, PUBLIC_CHANNELS.main, copied.message_id, '🤡').catch(() => {});
+      scheduleClownReaction(bot.telegram, PUBLIC_CHANNELS.main, copied.message_id, 1000);
     }
     db.saveAnnouncementInfo(f.title, f.category, sent.message_id, mainMsgId, channel);
   } else {
@@ -212,13 +218,13 @@ async function _announceSeries(f: any) {
 
     const { caption, keyboard } = _buildSeriesCaption(f, true);
     const sent = await bot.telegram.sendPhoto(channel, f.poster_url, { caption, parse_mode: 'HTML', ...keyboard });
-    setMessageReaction(bot.telegram, channel, sent.message_id, '🤡').catch(() => {});
+    scheduleClownReaction(bot.telegram, channel, sent.message_id, 1000);
 
     let mainMsgId = null;
     if (PUBLIC_CHANNELS.main) {
       const copied = await bot.telegram.copyMessage(PUBLIC_CHANNELS.main, channel, sent.message_id, { reply_markup: keyboard.reply_markup });
       mainMsgId = copied.message_id;
-      setMessageReaction(bot.telegram, PUBLIC_CHANNELS.main, copied.message_id, '🤡').catch(() => {});
+      scheduleClownReaction(bot.telegram, PUBLIC_CHANNELS.main, copied.message_id, 1000);
     }
     db.saveAnnouncementInfo(f.title, f.category, sent.message_id, mainMsgId, channel);
   }

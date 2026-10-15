@@ -422,6 +422,46 @@ async function showSeasonPicker(ctx: any, title: string, seasons: number[], cate
   }
 }
 
+/**
+ * Formats a clean, simple caption for delivered files:
+ * 🤡 <b>{Title} ({Year})</b> [{Quality}]
+ * <i>@VinehillMain</i>
+ *
+ * If quality is unknown, it is NOT mentioned at all.
+ */
+export function formatSimpleCaption(f: any): string {
+  let titleStr = f.title || 'Media File';
+  if (f.year) {
+    titleStr += ` (${f.year})`;
+  }
+
+  // Episode notation if series/anime
+  let epStr = '';
+  if (f.season !== null && f.season !== undefined && f.episode !== null && f.episode !== undefined) {
+    const sPadded = String(f.season).padStart(2, '0');
+    const ePadded = String(f.episode).padStart(2, '0');
+    epStr = ` • S${sPadded}E${ePadded}`;
+  } else if (f.episode !== null && f.episode !== undefined) {
+    epStr = ` • Ep ${f.episode}`;
+  }
+
+  // Quality resolution extraction - completely omitted if unknown
+  let qualityTag = '';
+  const rawQuality = (typeof f.quality === 'string' ? f.quality : '')?.trim();
+  if (rawQuality && !/^(unknown|none|null|undefined)$/i.test(rawQuality)) {
+    qualityTag = ` [${rawQuality.toUpperCase()}]`;
+  } else if (f.file_name) {
+    const qMatch = f.file_name.match(/(4320p|2160p|4k|1080p|720p|480p|360p)/i);
+    if (qMatch) {
+      qualityTag = ` [${qMatch[0].toUpperCase()}]`;
+    }
+  }
+
+  const mainChan = process.env.CH_MAIN || '@VinehillMain';
+
+  return `🤡 <b>${titleStr}${epStr}</b>${qualityTag}\n<i>${mainChan}</i>`;
+}
+
 async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string, fallbackTitle?: string, fallbackCategory?: string) {
   if (files.length === 0) {
     return await handleDownloadFailure(ctx, fallbackTitle || 'Media', fallbackCategory || 'media', encodedPayload, 'No files found in storage');
@@ -460,13 +500,15 @@ async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string, fa
         }
       }
 
-      // No caption for delivered files (clean renamed file delivery)
-      const copyExtra: any = { caption: '' };
+      // Simple caption for delivered files
+      const caption = formatSimpleCaption(f);
+
+      const copyExtra: any = { caption, parse_mode: 'HTML' };
       if (inline_keyboard) {
         copyExtra.reply_markup = { inline_keyboard };
       }
 
-      const docExtra: any = {};
+      const docExtra: any = { caption, parse_mode: 'HTML' };
       if (inline_keyboard) {
         docExtra.reply_markup = { inline_keyboard };
       }
@@ -519,8 +561,10 @@ async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string, fa
       if (sent) {
         deliveredCount++;
         sentMsgIds.push(sent.message_id);
-        // Add clown emoji reaction to received file!
-        setMessageReaction(ctx.telegram, ctx.from.id, sent.message_id, '🤡').catch(() => {});
+        // Add clown emoji reaction 1 second after receiving file
+        setTimeout(() => {
+          setMessageReaction(ctx.telegram, ctx.from.id, sent.message_id, '🤡').catch(() => {});
+        }, 1000);
         await new Promise(r => setTimeout(r, 800)); // Respect rate limits
       } else {
         throw new Error(lastErrorReason || 'File delivery failed: media identifier could not be resolved');
@@ -531,13 +575,19 @@ async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string, fa
       if (error.response?.status === 429) {
         const wait = (error.parameters?.retry_after || 5) * 1000;
         await new Promise(r => setTimeout(r, wait));
-        const retryExtra: any = (f.category === 'movies' && inline_keyboard) ? { reply_markup: { inline_keyboard } } : {};
+        const caption = formatSimpleCaption(f);
+        const retryExtra: any = { caption, parse_mode: 'HTML' };
+        if (f.category === 'movies' && inline_keyboard) {
+          retryExtra.reply_markup = { inline_keyboard };
+        }
         try {
           const sent = await ctx.replyWithDocument(f.file_id, retryExtra);
           if (sent) {
             deliveredCount++;
             sentMsgIds.push(sent.message_id);
-            setMessageReaction(ctx.telegram, ctx.from.id, sent.message_id, '🤡').catch(() => {});
+            setTimeout(() => {
+              setMessageReaction(ctx.telegram, ctx.from.id, sent.message_id, '🤡').catch(() => {});
+            }, 1000);
           }
         } catch (retryErr: any) {
           lastErrorReason = retryErr?.message || 'Retry delivery failed';
