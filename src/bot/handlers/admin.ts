@@ -290,22 +290,33 @@ export function registerAdmin() {
     return val !== 'false' && val !== 'off';
   }
 
-  function getDashboardView() {
+  async function getDashboardView() {
     const isEnabled = isForceSubEnabled();
     const mainChan = process.env.CH_MAIN || '@VinehillMain';
     const stats = db.getStats();
     const unresolvedFailures = db.getUnresolvedFailedCount();
+    const { getActiveRenameJob } = await import('../renamer');
+    const activeJob = getActiveRenameJob();
 
-    const text = 
+    let text = 
       `⚙️ 🤡 <b>Vinehill Admin Dashboard</b>\n\n` +
       `📢 <b>Joined Channel Check:</b> ${isEnabled ? '🟢 <b>ENABLED</b> (Main Channel Only)' : '🔴 <b>DISABLED</b> (Open / Free Access)'}\n` +
       `🚨 <b>Failed Downloads:</b> ${unresolvedFailures > 0 ? `⚠️ <b>${unresolvedFailures} unresolved issue(s)</b>` : '✅ All Clear (0 pending)'}\n` +
       `🎯 <b>Main Channel:</b> <code>${mainChan}</code>\n` +
       `📦 <b>Total Files in Library:</b> ${stats?.totalFiles ?? 'N/A'}\n` +
-      `👥 <b>Total Registered Users:</b> ${stats?.totalUsers ?? 'N/A'}\n\n` +
-      `<i>Use the buttons below to toggle channel checks or manage library tasks:</i>`;
+      `👥 <b>Total Registered Users:</b> ${stats?.totalUsers ?? 'N/A'}\n`;
+
+    if (activeJob) {
+      text += `⚡ <b>Active Rename Running:</b> <code>${activeJob.originalFileName}</code>\n`;
+    }
+
+    text += `\n<i>Use the buttons below to toggle channel checks or manage library tasks:</i>`;
 
     const buttons = [];
+
+    if (activeJob) {
+      buttons.push([{ text: `🛑 Cancel Ongoing Rename: ${activeJob.originalFileName.slice(0, 16)}...`, callback_data: `cancel_rename:${activeJob.id}` }]);
+    }
 
     if (unresolvedFailures > 0) {
       buttons.push([{ text: `⚠️ View Failed Downloads (${unresolvedFailures})`, callback_data: 'adm:failed' }]);
@@ -332,17 +343,29 @@ export function registerAdmin() {
   // /admin command & nav:admin callback
   bot.command('admin', async (ctx) => {
     if (ctx.from.id.toString() !== getAdminId()) return;
-    const { text, buttons } = getDashboardView();
+    const { text, buttons } = await getDashboardView();
     ctx.reply(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
   });
 
   bot.action('nav:admin', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     if (ctx.from.id.toString() !== getAdminId()) return;
-    const { text, buttons } = getDashboardView();
+    const { text, buttons } = await getDashboardView();
     ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } }).catch(() => {
       ctx.reply(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
     });
+  });
+
+  // /cancelrename and /abort commands for manual cancellation
+  bot.command(['cancelrename', 'abort'], async (ctx) => {
+    if (ctx.from.id.toString() !== getAdminId()) return;
+    const { cancelActiveRenameJob, getActiveRenameJob } = await import('../renamer');
+    const active = getActiveRenameJob();
+    if (!active) {
+      return ctx.reply('ℹ️ <b>No active download or rename process running.</b>', { parse_mode: 'HTML' });
+    }
+    cancelActiveRenameJob();
+    ctx.reply(`🛑 <b>Cancellation requested for:</b>\n<code>${active.originalFileName}</code>\n\nAborting transfer and cleaning temporary cache...`, { parse_mode: 'HTML' });
   });
 
   // Toggle Force-Sub Action
@@ -357,7 +380,7 @@ export function registerAdmin() {
     const nextStateStr = nextVal === 'true' ? '🟢 ENABLED' : '🔴 DISABLED';
     await ctx.answerCbQuery(`Channel Check is now ${nextStateStr}!`, { show_alert: true });
 
-    const { text, buttons } = getDashboardView();
+    const { text, buttons } = await getDashboardView();
     await ctx.editMessageText(text, {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: buttons }
@@ -382,7 +405,7 @@ export function registerAdmin() {
       isEnabled = !isEnabled;
     }
 
-    const { text, buttons } = getDashboardView();
+    const { text, buttons } = await getDashboardView();
     return ctx.reply(text, {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: buttons }
@@ -509,6 +532,25 @@ export function registerAdmin() {
     });
     await ctx.answerCbQuery('✅ All failures marked as resolved!', { show_alert: true });
     await showFailedDeliveriesView(ctx, true);
+  });
+
+  // Cancel ongoing download & rename pipeline via inline button
+  bot.action(/^cancel_rename:(.+)$/, async (ctx) => {
+    if (ctx.from.id.toString() !== getAdminId()) {
+      return ctx.answerCbQuery('Forbidden', { show_alert: true });
+    }
+    const jobId = ctx.match[1];
+    const { cancelActiveRenameJob, getActiveRenameJob } = await import('../renamer');
+    const active = getActiveRenameJob();
+    if (!active) {
+      return ctx.answerCbQuery('ℹ️ No active download or rename process running.', { show_alert: true });
+    }
+    const cancelled = cancelActiveRenameJob(jobId);
+    if (cancelled) {
+      await ctx.answerCbQuery('🛑 Cancelling download & rename...', { show_alert: true });
+    } else {
+      await ctx.answerCbQuery('ℹ️ Job already finished or ID mismatched.', { show_alert: false });
+    }
   });
 
   bot.action('adm:close', async (ctx) => {
