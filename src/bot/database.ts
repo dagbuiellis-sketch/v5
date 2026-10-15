@@ -145,6 +145,16 @@ export async function initDb() {
       PRIMARY KEY (user_id, title, category)
     );
 
+    CREATE TABLE IF NOT EXISTS failed_deliveries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      category TEXT NOT NULL,
+      error_reason TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE INDEX IF NOT EXISTS idx_files_title ON files(title);
     CREATE INDEX IF NOT EXISTS idx_files_category ON files(category);
     CREATE INDEX IF NOT EXISTS idx_files_category_title ON files(category, title);
@@ -154,6 +164,8 @@ export async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id);
     CREATE INDEX IF NOT EXISTS idx_likes_user ON likes(user_id);
     CREATE INDEX IF NOT EXISTS idx_search_history_user ON search_history(user_id);
+    CREATE INDEX IF NOT EXISTS idx_failed_deliveries_user ON failed_deliveries(user_id);
+    CREATE INDEX IF NOT EXISTS idx_failed_deliveries_status ON failed_deliveries(status);
   `);
 
   // Migration: Add main_msg_id if missing from announcements
@@ -441,6 +453,88 @@ export const getPendingDeletions = () => {
 
 export const markDeleted = (id: number) => {
   return db.prepare('UPDATE deliveries SET deleted = 1 WHERE id = ?').run(id);
+};
+
+// Failed Deliveries Tracking & Recovery
+export const recordFailedDelivery = (userId: number, title: string, category: string, errorReason: string): number => {
+  try {
+    const stmt = db.prepare(`
+      INSERT INTO failed_deliveries (user_id, title, category, error_reason, status)
+      VALUES (?, ?, ?, ?, 'pending')
+    `);
+    const info = stmt.run(userId, title, category, errorReason);
+    return Number(info.lastInsertRowid);
+  } catch (err) {
+    logger.error({ err }, 'Failed to record failed delivery');
+    return 0;
+  }
+};
+
+export const resolveFailedDelivery = (id: number, status = 'resolved') => {
+  try {
+    return db.prepare('UPDATE failed_deliveries SET status = ? WHERE id = ?').run(status, id);
+  } catch (err) {
+    logger.error({ err }, 'Failed to resolve failed delivery');
+  }
+};
+
+export const getRecentFailedDeliveries = (limit = 10) => {
+  try {
+    return db.prepare(`
+      SELECT fd.*, u.username, u.first_name 
+      FROM failed_deliveries fd
+      LEFT JOIN users u ON fd.user_id = u.id
+      ORDER BY fd.created_at DESC
+      LIMIT ?
+    `).all(limit) as any[];
+  } catch (err) {
+    logger.error({ err }, 'Failed to get recent failed deliveries');
+    return [];
+  }
+};
+
+export const getUnresolvedFailedCount = (): number => {
+  try {
+    const row = db.prepare("SELECT COUNT(*) as count FROM failed_deliveries WHERE status = 'pending'").get() as { count: number } | undefined;
+    return row?.count || 0;
+  } catch (err) {
+    return 0;
+  }
+};
+
+export const findAlternativeMedia = (rawTitle: string, category?: string) => {
+  try {
+    const cleaned = cleanTitle(rawTitle);
+    
+    // 1. Exact cleanTitle match
+    const exactQuery = category 
+      ? db.prepare("SELECT * FROM files WHERE category = ? AND (title = ? OR title = ?) AND file_id IS NOT NULL AND file_id != '' ORDER BY quality DESC LIMIT 10")
+      : db.prepare("SELECT * FROM files WHERE (title = ? OR title = ?) AND file_id IS NOT NULL AND file_id != '' ORDER BY quality DESC LIMIT 10");
+    
+    let matches = category ? exactQuery.all(category, rawTitle, cleaned) as any[] : exactQuery.all(rawTitle, cleaned) as any[];
+    if (matches.length > 0) return matches;
+
+    // 2. Substring match
+    const subQuery = category
+      ? db.prepare("SELECT * FROM files WHERE category = ? AND title LIKE ? AND file_id IS NOT NULL AND file_id != '' ORDER BY quality DESC LIMIT 10")
+      : db.prepare("SELECT * FROM files WHERE title LIKE ? AND file_id IS NOT NULL AND file_id != '' ORDER BY quality DESC LIMIT 10");
+    
+    matches = category ? subQuery.all(category, `%${cleaned}%`) as any[] : subQuery.all(`%${cleaned}%`) as any[];
+    if (matches.length > 0) return matches;
+
+    // 3. Keyword matching (words with >= 4 characters)
+    const keywords = cleaned.split(/[\s:,\-_]+/).filter(w => w.length >= 4);
+    if (keywords.length > 0) {
+      const primaryWord = keywords[0];
+      matches = category ? subQuery.all(category, `%${primaryWord}%`) as any[] : subQuery.all(`%${primaryWord}%`) as any[];
+      if (matches.length > 0) return matches;
+    }
+
+    return [];
+  } catch (err) {
+    logger.error({ err }, 'Error finding alternative media');
+    return [];
+  }
 };
 
 // Admin Stats

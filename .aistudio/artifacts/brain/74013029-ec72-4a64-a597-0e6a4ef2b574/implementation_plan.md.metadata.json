@@ -1,0 +1,6 @@
+{
+  "summary": "Implementation plan for auto-detecting and recovering failed downloads from announcement posts with admin alerts and user instant retry.",
+  "updatedAt": "2026-10-15T18:25:06.540562366Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

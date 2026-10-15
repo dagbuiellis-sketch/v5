@@ -95,6 +95,21 @@ export function registerDownload() {
     await deliverFiles(ctx, payload);
   });
 
+  // Callback for "Retry Download" (Instant Recovery)
+  bot.action(/^retry_dl:(.+)$/, async (ctx) => {
+    await ctx.answerCbQuery('🔄 Retrying download...').catch(() => {});
+    const payload = ctx.match[1];
+    const userId = ctx.from.id;
+
+    const missing = await checkMembership(ctx, userId);
+    if (missing.length > 0) {
+      return showJoinRequired(ctx, missing, payload);
+    }
+
+    await ctx.deleteMessage().catch(() => {});
+    await deliverFiles(ctx, payload);
+  });
+
   // Callback for selecting a season
   bot.action(/^sel_s:([^:]+):([^:]+):(.+)$/, async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
@@ -123,12 +138,27 @@ export function registerDownload() {
 
     if (action === 'all') {
       const season = parseInt(params[0]);
-      await sendMediaBatch(ctx, db.getSeasonFiles(title, season, category), encodedPayload);
+      let files = db.getSeasonFiles(title, season, category);
+      if (files.length === 0) {
+        const alt = db.findAlternativeMedia(title, category);
+        if (alt.length > 0) files = alt.filter((f: any) => f.season === season);
+      }
+      if (files.length === 0) {
+        return await handleDownloadFailure(ctx, `${title} Season ${season}`, category, encodedPayload, `No files found for Season ${season}`);
+      }
+      await sendMediaBatch(ctx, files, encodedPayload, `${title} Season ${season}`, category);
     } else {
       const season = parseInt(params[0]);
       const episode = parseInt(params[1]);
-      const files = db.db.prepare(`SELECT * FROM files WHERE title = ? AND season = ? AND episode = ? AND category = ? AND file_id != ''`).all(title, season, episode, category);
-      await sendMediaBatch(ctx, files, encodedPayload);
+      let files = db.db.prepare(`SELECT * FROM files WHERE title = ? AND season = ? AND episode = ? AND category = ? AND file_id != ''`).all(title, season, episode, category) as any[];
+      if (files.length === 0) {
+        const alt = db.findAlternativeMedia(title, category);
+        if (alt.length > 0) files = alt.filter((f: any) => f.season === season && f.episode === episode);
+      }
+      if (files.length === 0) {
+        return await handleDownloadFailure(ctx, `${title} S${season}E${episode}`, category, encodedPayload, `File not found for S${season}E${episode}`);
+      }
+      await sendMediaBatch(ctx, files, encodedPayload, `${title} S${season}E${episode}`, category);
     }
   });
 }
@@ -186,6 +216,72 @@ function showJoinRequired(ctx: any, missing: string[], payload: string) {
   );
 }
 
+/**
+ * Handles failed download attempts:
+ * 1. Logs failure in SQLite `failed_deliveries`
+ * 2. Alerts Admin via Telegram with user, file, and error details + resolve button
+ * 3. Sends user an instant recovery prompt with a 1-click retry button and search options
+ */
+async function handleDownloadFailure(
+  ctx: any,
+  title: string,
+  category: string,
+  encodedPayload: string,
+  errorReason: string
+) {
+  const userId = ctx.from?.id || ctx.chat?.id;
+  const username = ctx.from?.username ? `@${ctx.from.username}` : 'No username';
+  const fullName = [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') || 'User';
+
+  logger.warn({ userId, title, category, errorReason }, 'Download failure detected. Initiating recovery & admin alert...');
+
+  // 1. Record in database
+  const failureId = db.recordFailedDelivery(userId, title, category, errorReason);
+
+  // 2. Alert Admin
+  const adminId = getAdminId();
+  if (adminId) {
+    const adminAlertText =
+      `🚨 <b>Failed Download Detected</b>\n\n` +
+      `👤 <b>User:</b> ${fullName} (${username}) [ID: <code>${userId}</code>]\n` +
+      `📦 <b>Media:</b> <b>${db.cleanTitle(title)}</b> (${category})\n` +
+      `❌ <b>Reason:</b> <code>${errorReason}</code>\n` +
+      `🕒 <b>Time:</b> ${new Date().toISOString()}\n\n` +
+      `<i>Auto-recovery was attempted. The user received an instant retry card.</i>`;
+
+    const adminButtons = [
+      [{ text: '✅ Mark Resolved', callback_data: `adm_res:${failureId}` }]
+    ];
+
+    await bot.telegram.sendMessage(adminId, adminAlertText, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: adminButtons }
+    }).catch(err => {
+      logger.error({ err }, 'Failed to alert admin of download failure');
+    });
+  }
+
+  // 3. User Recovery Card
+  const userMsg =
+    `🤡 <b>Download Notice</b>\n\n` +
+    `We encountered a technical issue preparing <b>${db.cleanTitle(title)}</b>.\n\n` +
+    `🚨 <b>Don't worry!</b> Our administrator has been automatically notified and is looking into this.\n\n` +
+    `You can click <b>🔄 Retry Download</b> below to try again, or search our library for alternatives:`;
+
+  const userButtons = [
+    [{ text: '🔄 Retry Download', callback_data: `retry_dl:${encodedPayload}` }],
+    [
+      { text: '🔍 Search Library', callback_data: 'nav:search' },
+      { text: '🚩 Report Issue', callback_data: `rpt:${encodedPayload}` }
+    ]
+  ];
+
+  await ctx.reply(userMsg, {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: userButtons }
+  }).catch(() => {});
+}
+
 async function deliverFiles(ctx: any, encodedPayload: string, skipCheck = false) {
   const chat_id = ctx.chat.id;
   const user_id = ctx.from.id;
@@ -195,30 +291,70 @@ async function deliverFiles(ctx: any, encodedPayload: string, skipCheck = false)
     const payload = Buffer.from(sanitized, 'base64').toString('utf8');
     
     const firstColon = payload.indexOf(':');
-    if (firstColon === -1) return ctx.reply('🤡 <b>Invalid request payload.</b>', { parse_mode: 'HTML' });
+    if (firstColon === -1) {
+      return await handleDownloadFailure(ctx, 'Unknown', 'media', encodedPayload, 'Invalid request payload format');
+    }
     
     const category = payload.substring(0, firstColon);
     const title = payload.substring(firstColon + 1);
     
     if (['series', 'anime'].includes(category)) {
-      const seasons = db.getSeriesSeasons(title, category);
+      let seasons = db.getSeriesSeasons(title, category);
       if (seasons.length === 0) {
-        return ctx.reply('🤡 <b>No episodes found for this title.</b>', { parse_mode: 'HTML' });
+        // Auto-Recovery attempt 1: Search for alternative media title matches
+        const altFiles = db.findAlternativeMedia(title, category);
+        if (altFiles.length > 0) {
+          const altTitle = altFiles[0].title;
+          seasons = db.getSeriesSeasons(altTitle, category);
+          if (seasons.length > 0) {
+            const newPayload = Buffer.from(`${category}:${altTitle}`).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+            return await showSeasonPicker(ctx, altTitle, seasons, category, newPayload);
+          }
+        }
+        
+        return await handleDownloadFailure(ctx, title, category, encodedPayload, 'No episodes or seasons found in database');
       }
       
       // Always show season picker if it's series/anime, to allow episode-level choice
       await showSeasonPicker(ctx, title, seasons, category, encodedPayload);
     } else if (category === 'movies') {
-      await sendMediaBatch(ctx, db.getMoviesByTitle(title), encodedPayload);
+      let files = db.getMoviesByTitle(title);
+      if (files.length === 0) {
+        // Auto-Recovery attempt
+        const altFiles = db.findAlternativeMedia(title, 'movies');
+        if (altFiles.length > 0) {
+          logger.info({ title, count: altFiles.length }, 'Auto-recovered movie files via alternative search');
+          files = altFiles;
+        }
+      }
+
+      if (files.length === 0) {
+        return await handleDownloadFailure(ctx, title, category, encodedPayload, 'Movie file not found in library storage');
+      }
+
+      await sendMediaBatch(ctx, files, encodedPayload, title, category);
     } else if (category === 'games') {
-      await sendMediaBatch(ctx, db.getGameFiles(title), encodedPayload);
+      let files = db.getGameFiles(title);
+      if (files.length === 0) {
+        // Auto-Recovery attempt
+        const altFiles = db.findAlternativeMedia(title, 'games');
+        if (altFiles.length > 0) {
+          files = altFiles;
+        }
+      }
+
+      if (files.length === 0) {
+        return await handleDownloadFailure(ctx, title, category, encodedPayload, 'Game file not found in library storage');
+      }
+
+      await sendMediaBatch(ctx, files, encodedPayload, title, category);
     } else {
-      ctx.reply('Unknown category.');
+      await handleDownloadFailure(ctx, title, category, encodedPayload, `Unknown media category: ${category}`);
     }
 
-  } catch (error) {
+  } catch (error: any) {
     logger.error(`Delivery failed: ${error}`);
-    ctx.reply('Error delivering files.');
+    await handleDownloadFailure(ctx, 'Unknown', 'media', encodedPayload, error?.message || 'Internal delivery error');
   }
 }
 
@@ -251,6 +387,7 @@ async function showEpisodePicker(ctx: any, title: string, season: number, catego
     reply_markup: { inline_keyboard: buttons }
   }).catch(() => ctx.reply(msg, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } }));
 }
+
 async function showSeasonPicker(ctx: any, title: string, seasons: number[], category: string, encodedPayload: string) {
   const buttons = [];
   let row = [];
@@ -285,12 +422,15 @@ async function showSeasonPicker(ctx: any, title: string, seasons: number[], cate
   }
 }
 
-async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string) {
+async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string, fallbackTitle?: string, fallbackCategory?: string) {
   if (files.length === 0) {
-    return ctx.reply('🤡 <b>No files found in our storage for this title.</b>', { parse_mode: 'HTML' });
+    return await handleDownloadFailure(ctx, fallbackTitle || 'Media', fallbackCategory || 'media', encodedPayload, 'No files found in storage');
   }
 
   const sentMsgIds: number[] = [];
+  let deliveredCount = 0;
+  let lastErrorReason = '';
+
   const warnMsg = await ctx.reply('🤡 <b>Fetching your requested files...</b>\n\nThese files will be <b>deleted in 5 minutes</b> for security. Forward them to your <b>Saved Messages</b> to keep them permanently!', { parse_mode: 'HTML' });
   sentMsgIds.push(warnMsg.message_id);
 
@@ -337,8 +477,9 @@ async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string) {
       if (f.channel_id && f.message_id) {
         try {
           sent = await ctx.telegram.copyMessage(ctx.from.id, f.channel_id, f.message_id, copyExtra);
-        } catch (copyErr) {
+        } catch (copyErr: any) {
           logger.warn({ copyErr, file: f.title }, 'copyMessage failed, falling back...');
+          lastErrorReason = copyErr?.message || 'copyMessage failed';
         }
       }
 
@@ -346,8 +487,9 @@ async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string) {
       if (!sent && f.file_id && !/^\d+$/.test(f.file_id)) {
         try {
           sent = await ctx.replyWithDocument(f.file_id, docExtra);
-        } catch (docErr) {
+        } catch (docErr: any) {
           logger.warn({ docErr, file: f.title }, 'replyWithDocument failed');
+          lastErrorReason = docErr?.message || 'replyWithDocument failed';
         }
       }
 
@@ -368,32 +510,51 @@ async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string) {
               sent = await ctx.telegram.copyMessage(ctx.from.id, targetChan, matched.id, copyExtra);
             }
           }
-        } catch (legacyErr) {
+        } catch (legacyErr: any) {
           logger.error({ legacyErr }, 'Legacy MTProto resolution failed');
+          lastErrorReason = legacyErr?.message || 'MTProto resolution failed';
         }
       }
 
       if (sent) {
+        deliveredCount++;
         sentMsgIds.push(sent.message_id);
         // Add clown emoji reaction to received file!
         setMessageReaction(ctx.telegram, ctx.from.id, sent.message_id, '🤡').catch(() => {});
         await new Promise(r => setTimeout(r, 800)); // Respect rate limits
       } else {
-        throw new Error('File delivery failed: media identifier could not be resolved');
+        throw new Error(lastErrorReason || 'File delivery failed: media identifier could not be resolved');
       }
     } catch (error: any) {
       logger.error({ err: error, file_id: f.file_id, title: f.title }, 'File delivery failed');
+      lastErrorReason = error?.message || 'Delivery error';
       if (error.response?.status === 429) {
         const wait = (error.parameters?.retry_after || 5) * 1000;
         await new Promise(r => setTimeout(r, wait));
         const retryExtra: any = (f.category === 'movies' && inline_keyboard) ? { reply_markup: { inline_keyboard } } : {};
-        const sent = await ctx.replyWithDocument(f.file_id, retryExtra);
-        sentMsgIds.push(sent.message_id);
-        setMessageReaction(ctx.telegram, ctx.from.id, sent.message_id, '🤡').catch(() => {});
-      } else {
-        await ctx.reply(`❌ <b>Failed to deliver:</b> ${db.cleanTitle(f.title)}\n<i>Reason: ${error.message || 'Internal Error'}</i>`, { parse_mode: 'HTML' }).catch(() => {});
+        try {
+          const sent = await ctx.replyWithDocument(f.file_id, retryExtra);
+          if (sent) {
+            deliveredCount++;
+            sentMsgIds.push(sent.message_id);
+            setMessageReaction(ctx.telegram, ctx.from.id, sent.message_id, '🤡').catch(() => {});
+          }
+        } catch (retryErr: any) {
+          lastErrorReason = retryErr?.message || 'Retry delivery failed';
+        }
       }
     }
+  }
+
+  // If nothing was successfully delivered, alert admin and offer user retry
+  if (deliveredCount === 0) {
+    return await handleDownloadFailure(
+      ctx,
+      files[0]?.title || fallbackTitle || 'Media',
+      files[0]?.category || fallbackCategory || 'media',
+      encodedPayload,
+      lastErrorReason || 'All delivery channels failed to deliver the file'
+    );
   }
 
   db.saveDelivery(ctx.from.id, files.map(f => f.file_id), sentMsgIds, new Date(Date.now() + 5 * 60 * 1000));

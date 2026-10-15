@@ -294,26 +294,37 @@ export function registerAdmin() {
     const isEnabled = isForceSubEnabled();
     const mainChan = process.env.CH_MAIN || '@VinehillMain';
     const stats = db.getStats();
+    const unresolvedFailures = db.getUnresolvedFailedCount();
 
     const text = 
       `⚙️ 🤡 <b>Vinehill Admin Dashboard</b>\n\n` +
       `📢 <b>Joined Channel Check:</b> ${isEnabled ? '🟢 <b>ENABLED</b> (Main Channel Only)' : '🔴 <b>DISABLED</b> (Open / Free Access)'}\n` +
+      `🚨 <b>Failed Downloads:</b> ${unresolvedFailures > 0 ? `⚠️ <b>${unresolvedFailures} unresolved issue(s)</b>` : '✅ All Clear (0 pending)'}\n` +
       `🎯 <b>Main Channel:</b> <code>${mainChan}</code>\n` +
       `📦 <b>Total Files in Library:</b> ${stats?.totalFiles ?? 'N/A'}\n` +
       `👥 <b>Total Registered Users:</b> ${stats?.totalUsers ?? 'N/A'}\n\n` +
       `<i>Use the buttons below to toggle channel checks or manage library tasks:</i>`;
 
-    const buttons = [
+    const buttons = [];
+
+    if (unresolvedFailures > 0) {
+      buttons.push([{ text: `⚠️ View Failed Downloads (${unresolvedFailures})`, callback_data: 'adm:failed' }]);
+    }
+
+    buttons.push(
       [{ text: `📢 Channel Check: ${isEnabled ? '🟢 ENABLED (Click to Turn OFF)' : '🔴 DISABLED (Click to Turn ON)'}`, callback_data: 'adm_toggle_forcesub' }],
       [
         { text: '📊 Full Stats', callback_data: 'adm:stats' },
         { text: '🔄 Sync Announcements', callback_data: 'adm:sync' }
       ],
       [
-        { text: '🧹 Purge Orphaned Files', callback_data: 'adm:purge' },
+        { text: '⚠️ Failed Log', callback_data: 'adm:failed' },
+        { text: '🧹 Purge Orphaned Files', callback_data: 'adm:purge' }
+      ],
+      [
         { text: '❌ Close Dashboard', callback_data: 'adm:close' }
       ]
-    ];
+    );
 
     return { text, buttons };
   }
@@ -411,6 +422,93 @@ export function registerAdmin() {
     if (ctx.from.id.toString() !== getAdminId()) return;
     const result = db.purgeEmptyFiles();
     ctx.reply(`🤡 <b>Purge Complete</b>\n\nRemoved <b>${result.changes}</b> orphaned file entries.`, { parse_mode: 'HTML' });
+  });
+
+  // View Failed Deliveries Log
+  const showFailedDeliveriesView = async (ctx: any, isEdit = false) => {
+    const failures = db.getRecentFailedDeliveries(10);
+    if (failures.length === 0) {
+      const emptyMsg = '✅ <b>No failed download deliveries recorded.</b> Everything is running smoothly!';
+      if (isEdit) {
+        return ctx.editMessageText(emptyMsg, {
+          parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '⬅️ Back to Dashboard', callback_data: 'nav:admin' }]] }
+        }).catch(() => ctx.reply(emptyMsg, { parse_mode: 'HTML' }));
+      }
+      return ctx.reply(emptyMsg, { parse_mode: 'HTML' });
+    }
+
+    let text = `🚨 <b>Recent Failed Downloads (${failures.length})</b>\n\n`;
+    const buttons: any[] = [];
+
+    failures.forEach((f: any) => {
+      const userStr = f.username ? `@${f.username}` : `User ${f.first_name || f.user_id}`;
+      const statusIcon = f.status === 'pending' ? '🔴 [PENDING]' : '🟢 [RESOLVED]';
+      text += `${statusIcon} <b>#${f.id}</b> — <b>${db.cleanTitle(f.title)}</b> (${f.category})\n`;
+      text += `👤 <b>User:</b> ${userStr} (<code>${f.user_id}</code>)\n`;
+      text += `❌ <b>Reason:</b> <code>${f.error_reason}</code>\n`;
+      text += `🕒 <b>Time:</b> ${new Date(f.created_at).toLocaleString()}\n\n`;
+
+      if (f.status === 'pending') {
+        buttons.push([{ text: `✅ Resolve #${f.id} (${db.cleanTitle(f.title).slice(0, 18)})`, callback_data: `adm_res:${f.id}` }]);
+      }
+    });
+
+    buttons.push([
+      { text: '✅ Resolve All', callback_data: 'adm_res_all' },
+      { text: '⬅️ Back to Dashboard', callback_data: 'nav:admin' }
+    ]);
+
+    if (isEdit) {
+      await ctx.editMessageText(text, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: buttons }
+      }).catch(() => ctx.reply(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } }));
+    } else {
+      await ctx.reply(text, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: buttons }
+      });
+    }
+  };
+
+  bot.command('failed', async (ctx) => {
+    if (ctx.from.id.toString() !== getAdminId()) return;
+    await showFailedDeliveriesView(ctx, false);
+  });
+
+  bot.action('adm:failed', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (ctx.from.id.toString() !== getAdminId()) return;
+    await showFailedDeliveriesView(ctx, true);
+  });
+
+  // Resolve single failure
+  bot.action(/^adm_res:(\d+)$/, async (ctx) => {
+    if (ctx.from.id.toString() !== getAdminId()) {
+      return ctx.answerCbQuery('Forbidden', { show_alert: true });
+    }
+    const id = parseInt(ctx.match[1]);
+    db.resolveFailedDelivery(id, 'admin_resolved');
+    await ctx.answerCbQuery('✅ Marked as resolved!', { show_alert: false });
+    
+    // Refresh the view
+    await showFailedDeliveriesView(ctx, true);
+  });
+
+  // Resolve all pending failures
+  bot.action('adm_res_all', async (ctx) => {
+    if (ctx.from.id.toString() !== getAdminId()) {
+      return ctx.answerCbQuery('Forbidden', { show_alert: true });
+    }
+    const failures = db.getRecentFailedDeliveries(50);
+    failures.forEach((f: any) => {
+      if (f.status === 'pending') {
+        db.resolveFailedDelivery(f.id, 'admin_resolved');
+      }
+    });
+    await ctx.answerCbQuery('✅ All failures marked as resolved!', { show_alert: true });
+    await showFailedDeliveriesView(ctx, true);
   });
 
   bot.action('adm:close', async (ctx) => {
