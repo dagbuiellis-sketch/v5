@@ -502,8 +502,11 @@ async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string, fa
   }
 
   const sentMsgIds: number[] = [];
+  const deliveredMediaMsgIds: number[] = [];
   let deliveredCount = 0;
   let lastErrorReason = '';
+
+  const isEpisodic = ['series', 'anime'].includes(fallbackCategory || '') || files.some(f => ['series', 'anime'].includes(f.category));
 
   const warnMsg = await ctx.reply('🤡 <b>Fetching your requested files...</b>\n\nThese files will be <b>deleted in 5 minutes</b> for security. Forward them to your <b>Saved Messages</b> to keep them permanently!', { parse_mode: 'HTML' });
   sentMsgIds.push(warnMsg.message_id);
@@ -595,10 +598,15 @@ async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string, fa
       if (sent) {
         deliveredCount++;
         sentMsgIds.push(sent.message_id);
-        // Add clown emoji reaction 1 second after receiving file
-        setTimeout(() => {
-          setMessageReaction(ctx.telegram, ctx.from.id, sent.message_id, '🤡').catch(() => {});
-        }, 1000);
+        deliveredMediaMsgIds.push(sent.message_id);
+
+        // For non-series/anime media (movies, etc.), react 1 second after file
+        if (!isEpisodic) {
+          setTimeout(() => {
+            setMessageReaction(ctx.telegram, ctx.from.id, sent.message_id, '🤡').catch(() => {});
+          }, 1000);
+        }
+
         await new Promise(r => setTimeout(r, 800)); // Respect rate limits
       } else {
         throw new Error(lastErrorReason || 'File delivery failed: media identifier could not be resolved');
@@ -619,15 +627,27 @@ async function sendMediaBatch(ctx: any, files: any[], encodedPayload: string, fa
           if (sent) {
             deliveredCount++;
             sentMsgIds.push(sent.message_id);
-            setTimeout(() => {
-              setMessageReaction(ctx.telegram, ctx.from.id, sent.message_id, '🤡').catch(() => {});
-            }, 1000);
+            deliveredMediaMsgIds.push(sent.message_id);
+
+            if (!isEpisodic) {
+              setTimeout(() => {
+                setMessageReaction(ctx.telegram, ctx.from.id, sent.message_id, '🤡').catch(() => {});
+              }, 1000);
+            }
           }
         } catch (retryErr: any) {
           lastErrorReason = retryErr?.message || 'Retry delivery failed';
         }
       }
     }
+  }
+
+  // For series and anime: react ONLY to the last file received by the user
+  if (isEpisodic && deliveredMediaMsgIds.length > 0) {
+    const lastDeliveredMsgId = deliveredMediaMsgIds[deliveredMediaMsgIds.length - 1];
+    setTimeout(() => {
+      setMessageReaction(ctx.telegram, ctx.from.id, lastDeliveredMsgId, '🤡').catch(() => {});
+    }, 1000);
   }
 
   // If nothing was successfully delivered, alert admin and offer user retry

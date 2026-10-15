@@ -41,19 +41,26 @@ export function setupBot() {
 }
 
 /**
- * Safely react to a message with an emoji (e.g. 🤡)
+ * Safely react to a message with an emoji (e.g. 🤡) with playful big animation
  * Works across Telegram Bot API versions without failing if permissions are absent
  */
-export async function setMessageReaction(telegram: any, chatId: string | number, messageId: number, emoji = '🤡') {
+export async function setMessageReaction(
+  telegram: any,
+  chatId: string | number,
+  messageId: number,
+  emoji = '🤡',
+  isBig = true
+) {
   try {
-    if (typeof telegram.setMessageReaction === 'function') {
-      await telegram.setMessageReaction(chatId, messageId, [{ type: 'emoji', emoji }]);
-    } else {
+    if (typeof telegram.callApi === 'function') {
       await (telegram as any).callApi('setMessageReaction', {
         chat_id: chatId,
         message_id: messageId,
         reaction: [{ type: 'emoji', emoji }],
+        is_big: isBig,
       });
+    } else if (typeof telegram.setMessageReaction === 'function') {
+      await telegram.setMessageReaction(chatId, messageId, [{ type: 'emoji', emoji }], { is_big: isBig });
     }
   } catch (err: any) {
     logger.debug({ err: err?.message, chatId, messageId }, 'Reaction call skipped or failed');
