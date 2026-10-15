@@ -1,51 +1,51 @@
-# Implementation Plan: Playful Big Animated Clown Reactions
+# Implementation Plan: Fix Playful Animated Clown Reaction
 
-## 1. Overview
-When users manually react to messages in Telegram, long-pressing or tapping the reaction triggers Telegram's playful animated reaction effect (the emoji bursts and animates across the screen with sound and haptics).
-In the Telegram Bot API (version 7.0+), this effect is controlled by the `is_big` parameter in the `setMessageReaction` method.
-Currently, `setMessageReaction` in `src/bot/client.ts` omits `is_big`, resulting in the standard subtle static reaction badge.
-We will enable `is_big: true` by default so that both file deliveries and channel announcements receive the lively, playful big animated clown reaction.
+## 1. Root Cause Analysis
+1. **Telegram Client Animation vs. Bot API Limitations**:
+   - When a human user manually reacts to a message in the Telegram app, the local client renders an animated Lottie burst on the screen.
+   - In standard Bot API (`setMessageReaction`), Telegram receives the reaction and attaches the badge, but many Telegram clients (iOS, Android, Desktop) do not trigger full-screen burst animations for bot-applied reactions or in channels unless MTProto `big: true` flags are sent through the client protocol.
+2. **Telegraf vs. Telegram Bot API Parameter Formatting**:
+   - Telegraf's `setMessageReaction(chat_id, message_id, reaction, is_big)` takes a raw boolean `true` as its 4th argument. If passed an object `{ is_big: true }`, Telegraf serializes it as an object rather than a boolean, causing the Bot API to ignore the animation flag.
+3. **Missing MTProto Native Reaction Route**:
+   - The bot has an active GramJS MTProto client (`initMTProtoClient()`). MTProto supports `Api.messages.SendReaction({ peer, msgId, reaction: [new Api.ReactionEmoji({ emoticon: '🤡' })], big: true, addToRecent: true })`, which is the exact call Telegram client apps use when humans react.
 
 ---
 
 ## 2. Proposed Changes
 
 ### `src/bot/client.ts`
-1. **Update `setMessageReaction`**:
-   - Update parameter signature to include `isBig = true`.
-   - In `callApi('setMessageReaction', ...)` and `telegram.setMessageReaction(...)`, explicitly pass `is_big: isBig`.
-   - Ensure fallback handling supports both direct Telegraf method call and `callApi` payload structure:
+1. **Implement Dual-Route MTProto & Bot API Reaction Pipeline**:
+   - First attempt native MTProto reaction using GramJS `Api.messages.SendReaction`:
      ```typescript
-     export async function setMessageReaction(
-       telegram: any,
-       chatId: string | number,
-       messageId: number,
-       emoji = '🤡',
-       isBig = true
-     ) {
-       try {
-         if (typeof telegram.callApi === 'function') {
-           await (telegram as any).callApi('setMessageReaction', {
-             chat_id: chatId,
-             message_id: messageId,
-             reaction: [{ type: 'emoji', emoji }],
-             is_big: isBig,
-           });
-         } else if (typeof telegram.setMessageReaction === 'function') {
-           await telegram.setMessageReaction(chatId, messageId, [{ type: 'emoji', emoji }], { is_big: isBig });
-         }
-       } catch (err: any) {
-         logger.debug({ err: err?.message, chatId, messageId }, 'Reaction call skipped or failed');
-       }
+     import { Api } from 'telegram';
+     import { initMTProtoClient } from './renamer';
+
+     const mtClient = await initMTProtoClient();
+     if (mtClient) {
+       await mtClient.invoke(new Api.messages.SendReaction({
+         peer: chatId,
+         msgId: messageId,
+         reaction: [new Api.ReactionEmoji({ emoticon: emoji })],
+         big: true,
+         addToRecent: true
+       }));
      }
      ```
-
-### `src/bot/handlers/announcer.ts` & `src/bot/handlers/download.ts`
-1. Verify all callers of `setMessageReaction` and `scheduleClownReaction` inherit `isBig: true`.
-2. Ensure channel announcement posts and final media file deliveries both trigger the big animated reaction 1 second after arrival.
+   - Fall back to Telegraf Bot API with strict boolean types:
+     ```typescript
+     await (telegram as any).callApi('setMessageReaction', {
+       chat_id: chatId,
+       message_id: messageId,
+       reaction: [{ type: 'emoji', emoji }],
+       is_big: true,
+     });
+     ```
+2. **Enhanced Diagnostics**:
+   - Promote error logging from hidden `logger.debug` to `logger.warn` with descriptive diagnostic details if Telegram returns a code (e.g., `REACTION_INVALID`, `CHAT_NOT_MODIFIED`).
 
 ---
 
 ## 3. Verification Plan
-1. **Lint & Compilation**: Run `lint_applet` and `compile_applet` to confirm zero TypeScript compilation errors.
-2. **Behavioral Verification**: Verify that calls to `setMessageReaction` transmit `{ chat_id, message_id, reaction: [{ type: 'emoji', emoji: '🤡' }], is_big: true }` to Telegram Bot API.
+1. **Type & Syntax Checking**: Run `lint_applet` (`tsc --noEmit`) to verify zero TypeScript errors.
+2. **Compilation Verification**: Run `compile_applet` to confirm clean build.
+3. **Execution Verification**: Verify that reactions call MTProto `SendReaction` with `big: true` and fall back cleanly to Bot API `is_big: true`.
