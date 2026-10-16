@@ -120,7 +120,23 @@ async function flushBatch(batchKey: string) {
 /**
  * Post to specific channels
  */
+export async function retryAnnounce(fileData: any) {
+  announceQueue.push(fileData);
+  processAnnounceQueue();
+}
+
 async function _doAnnounce(f: any) {
+  // Check if cover art is valid for movies, series, anime
+  if (['movies', 'series', 'anime'].includes(f.category)) {
+    const hasCover = Boolean(f.poster_url && f.poster_url.trim().length > 0);
+    if (!hasCover) {
+      logger.warn(`⚠️ Announcer cover art check failed for "${f.title}". Holding announcement for admin correction...`);
+      const { promptAdminAnnounceCorrection } = await import('./admin');
+      await promptAdminAnnounceCorrection(f);
+      return;
+    }
+  }
+
   const category = f.category;
   if (['series', 'anime'].includes(category)) {
     await _announceSeries(f);

@@ -101,6 +101,8 @@ export async function initMTProtoClient(): Promise<TelegramClient | null> {
 
 import { bot, getAdminId } from './client';
 
+import { TMDBMeta } from './tmdb';
+
 export interface RenameJob {
   id?: string;
   sourceChannelId: string;
@@ -112,6 +114,9 @@ export interface RenameJob {
   progressMsgId?: number;
   targetChannelId?: string;
   adminChatId?: string | number;
+  customTitle?: string;
+  customYear?: number;
+  verifiedMeta?: TMDBMeta;
 }
 
 const renameQueue: RenameJob[] = [];
@@ -162,6 +167,9 @@ export async function processRenameQueue() {
 
 async function executeBotApiFallback(job: RenameJob, destinationChannel: string) {
   const parsed = parseFilename(job.originalFileName);
+  if (job.customTitle) parsed.title = job.customTitle;
+  if (job.customYear) parsed.year = job.customYear;
+
   const targetFileName = formatRenamedFilename(parsed, job.originalFileName);
   const yearStr = parsed.year ? ` (${parsed.year})` : '';
   const episodeStr = (parsed.season && parsed.episode) ? ` S${parsed.season}E${parsed.episode}` : '';
@@ -186,7 +194,8 @@ async function executeBotApiFallback(job: RenameJob, destinationChannel: string)
         job.category,
         targetFileName,
         destinationChannel,
-        job.fileSize
+        job.fileSize,
+        job.verifiedMeta
       );
       logger.info(`✅ Successfully copied and indexed "${targetFileName}" via Bot API fallback!`);
     }
@@ -221,6 +230,8 @@ async function executeRenameJob(job: RenameJob) {
   }
 
   const parsed = parseFilename(job.originalFileName);
+  if (job.customTitle) parsed.title = job.customTitle;
+  if (job.customYear) parsed.year = job.customYear;
   const targetFileName = formatRenamedFilename(parsed, job.originalFileName);
 
   logger.info(`⚡ Starting Download & Rename Pipeline:`);
@@ -302,7 +313,7 @@ async function executeRenameJob(job: RenameJob) {
       const forwardedMsg = forwardedMsgs?.[0];
       if (forwardedMsg) {
         const { handleUploadedRenamedMedia } = await import('./handlers/indexer');
-        await handleUploadedRenamedMedia(forwardedMsg, job.category, targetFileName, destinationChannel);
+        await handleUploadedRenamedMedia(forwardedMsg, job.category, targetFileName, destinationChannel, job.fileSize, job.verifiedMeta);
         logger.info(`✅ Successfully forwarded & indexed oversized file: ${targetFileName}`);
 
         if (destinationChannel && progressMsgId) {
@@ -423,7 +434,7 @@ async function executeRenameJob(job: RenameJob) {
 
     // 4. Pass the newly uploaded media to the indexer so it announces and indexes from the renamed channel
     const { handleUploadedRenamedMedia } = await import('./handlers/indexer');
-    await handleUploadedRenamedMedia(uploadedMessage, job.category, targetFileName, destinationChannel);
+    await handleUploadedRenamedMedia(uploadedMessage, job.category, targetFileName, destinationChannel, job.fileSize, job.verifiedMeta);
 
     if (destinationChannel && progressMsgId) {
       bot.telegram.editMessageText(

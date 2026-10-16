@@ -218,11 +218,12 @@ export async function handleUploadedRenamedMedia(
   category: string, 
   renamedFileName: string, 
   destinationChannel?: string,
-  explicitFileSize?: number
+  explicitFileSize?: number,
+  explicitMeta?: any
 ) {
   try {
     const parsed = parseFilename(renamedFileName);
-    const meta = await searchTMDB(parsed.title, parsed.year, category);
+    const meta = explicitMeta || await searchTMDB(parsed.title, parsed.year, category);
 
     const docId = uploadedMessage.media?.document?.id?.toString() || 
                   uploadedMessage.document?.file_id || 
@@ -287,12 +288,37 @@ export function registerIndexer() {
       if (media && ['movies', 'series', 'anime'].includes(rawCategory)) {
         const detectedName = media.file_name || post.caption || `${rawCategory}_file`;
         logger.info(`📥 Raw file detected in staging channel (${rawCategory}): ${detectedName}`);
+
+        const parsed = parseFilename(detectedName);
+        const meta = await searchTMDB(parsed.title, parsed.year, rawCategory);
+        const hasValidTitle = Boolean(meta.title && meta.title.trim().length > 0);
+        const hasValidCover = Boolean(meta.poster_url && meta.poster_url.trim().length > 0);
+
+        if (!hasValidTitle || !hasValidCover) {
+          logger.warn(`⚠️ Pre-verification failed for "${detectedName}": ${!hasValidTitle ? 'Title not found on TMDB' : 'Cover art missing on TMDB'}. Holding for admin correction...`);
+          const { promptAdminStagingCorrection } = await import('./admin');
+          await promptAdminStagingCorrection({
+            sourceChannelId: channelId,
+            sourceMessageId: post.message_id,
+            originalFileName: detectedName,
+            fileSize: media.file_size || 0,
+            category: rawCategory,
+            parsedTitle: parsed.title,
+            parsedYear: parsed.year,
+            issue: !hasValidTitle ? 'Title not found on TMDB' : 'Poster cover art missing on TMDB',
+          });
+          return;
+        }
+
         queueRenameJob({
           sourceChannelId: channelId,
           sourceMessageId: post.message_id,
           originalFileName: detectedName,
           fileSize: media.file_size || 0,
           category: rawCategory,
+          customTitle: meta.title,
+          customYear: meta.year,
+          verifiedMeta: meta,
         });
         return;
       } else if (media) {

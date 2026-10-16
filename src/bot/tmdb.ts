@@ -101,3 +101,82 @@ export async function getShowStatus(title: string, category: string): Promise<st
     return "";
   }
 }
+
+export interface TMDBCandidate {
+  tmdb_id: number;
+  title: string;
+  year?: number;
+  poster_url?: string;
+  hasCover: boolean;
+  overview?: string;
+  rating?: string;
+  category: string;
+}
+
+export async function searchTMDBCandidates(query: string, category: string, limit = 5): Promise<TMDBCandidate[]> {
+  if (!TMDB_API_KEY) {
+    logger.warn('TMDB_API_KEY is missing. Skipping candidate search.');
+    return [];
+  }
+
+  try {
+    const type = category === 'movies' ? 'movie' : 'tv';
+    const params = {
+      api_key: TMDB_API_KEY,
+      query: query.trim(),
+    };
+
+    const response = await axios.get(`${BASE_URL}/search/${type}`, { params });
+    const results: any[] = response.data?.results || [];
+
+    return results.slice(0, limit).map((r: any) => {
+      const releaseDate = r.release_date || r.first_air_date || '';
+      const year = releaseDate ? parseInt(releaseDate.split('-')[0]) : undefined;
+      const posterPath = r.poster_path;
+      return {
+        tmdb_id: r.id,
+        title: r.title || r.name || 'Unknown',
+        year,
+        poster_url: posterPath ? `${IMAGE_BASE}${posterPath}` : undefined,
+        hasCover: Boolean(posterPath && posterPath.trim().length > 0),
+        overview: r.overview,
+        rating: r.vote_average ? Number(r.vote_average).toFixed(1) : undefined,
+        category,
+      };
+    });
+  } catch (error) {
+    logger.error(`TMDB candidate search failed: ${error}`);
+    return [];
+  }
+}
+
+export async function getTMDBDetails(tmdbId: number, category: string): Promise<TMDBMeta | null> {
+  if (!TMDB_API_KEY) return null;
+
+  try {
+    const type = category === 'movies' ? 'movie' : 'tv';
+    const response = await axios.get(`${BASE_URL}/${type}/${tmdbId}`, {
+      params: { api_key: TMDB_API_KEY }
+    });
+    const result = response.data;
+    if (!result) return null;
+
+    const genreNames = (result.genres || []).map((g: any) => g.name).filter(Boolean).join(', ');
+    const releaseDate = result.release_date || result.first_air_date || '';
+    const year = releaseDate ? parseInt(releaseDate.split('-')[0]) : undefined;
+
+    return {
+      title: result.title || result.name,
+      year,
+      poster_url: result.poster_path ? `${IMAGE_BASE}${result.poster_path}` : undefined,
+      overview: result.overview,
+      rating: result.vote_average ? Number(result.vote_average).toFixed(1) : undefined,
+      genres: genreNames,
+      tmdb_id: result.id,
+    };
+  } catch (error) {
+    logger.error(`TMDB getDetails failed: ${error}`);
+    return null;
+  }
+}
+

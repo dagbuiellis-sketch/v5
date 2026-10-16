@@ -1,54 +1,95 @@
-# Implementation Plan: Fix GramJS MTProto FloodWait & Enable Seamless Bot API Fallback
+# Implementation Plan: Title & Cover Art Verification Gate with Interactive Suggestions
 
-## 1. Problem Diagnosis
-In the provided logs:
-```
-FloodWaitError: A wait of 3125 seconds is required (caused by auth.ImportBotAuthorization)
-```
-- **Root Cause**: `initMTProtoClient()` initialized a new `StringSession('')` on startup without saving the session string to persistent storage. Every time the bot restarted or initialized, it called `client.start({ botAuthToken })`, invoking Telegram's `auth.importBotAuthorization`. Telegram enforces a rate-limit on new authorization handshakes from the same IP/token; once exceeded, it blocks new authorizations for ~52 minutes (3,125 seconds).
-- **Secondary Problem**: When `initMTProtoClient()` failed or returned `null`, `executeRenameJob()` logged a warning and skipped the file entirely. The file sat in the staging channel and was never copied, renamed, or indexed.
+## 1. Overview & User Additions
+This plan expands the verification gate based on user requirements:
+1. **Verification on Staging & Announcer**:
+   - Apply TMDB existence and cover art (`poster_url`) verification when raw files enter staging channels **and** before messages are published by the Announcer.
+   - If either the title does not exist or cover art is missing, the file/announcement is **strictly paused**.
+2. **Interactive Suggestions While Typing**:
+   - When the admin provides a keyword or partial title, the bot queries TMDB `/search/multi` (or `/search/movie` / `/search/tv`) and immediately presents the **top matching candidates** as interactive 1-tap buttons (displaying Title, Release Year, and Cover Art status).
+   - In addition, an inline search button (`switch_inline_query_current_chat`) allows the admin to view live suggestions directly above their keyboard as they type.
 
 ---
 
-## 2. Solution Architecture
+## 2. Architecture & File Changes
 
-### A. Session Persistence (`src/bot/renamer.ts`)
-1. **Load Existing Session**:
-   - Check `process.env.TELEGRAM_SESSION` first.
-   - If not set, retrieve the saved session string from the SQLite `config` table (`db.getConfig('TELEGRAM_SESSION')`).
-2. **Persist Active Session**:
-   - Once `client.start()` succeeds, call `client.session.save()` and store the session key in SQLite (`db.setConfig('TELEGRAM_SESSION', sessionStr)`).
-   - Future bot restarts will reuse this authenticated session key, bypassing `auth.importBotAuthorization` and completely preventing future flood waits.
-
-### B. FloodWait Cooldown Handling & Admin Awareness (`src/bot/renamer.ts`)
-1. Detect `FloodWaitError` or `error.seconds` when starting GramJS:
-   - Calculate `floodWaitUntil = Date.now() + (seconds * 1000)`.
-   - Prevent redundant connection attempts until the cooldown has passed.
-2. Alert the bot administrator once with a clear status notice:
-   - Explain that Telegram MTProto is temporarily cooling down.
-   - Reassure that the automatic Bot API fallback is actively processing and indexing all files.
-
-### C. Automatic Zero-Loss Bot API Fallback (`src/bot/renamer.ts`)
-1. If GramJS MTProto is unavailable (due to FloodWait cooldown, unconfigured keys, or network limits):
-   - **Do not drop or skip files**.
-   - Use Telegram's Bot API (`bot.telegram.copyMessage`) to transfer the file from the staging channel directly to the target channel (`@renamed_movies`, `@renamed_series`, `@renamed_anime`).
-   - Format and attach the proper caption:
-     ```html
-     🎬 <b>{Title} ({Year})</b>
-     🏷 <i>{TargetFileName}</i>
-
-     @VinehillMain
+### A. TMDB Multi-Candidate Search Helper (`src/bot/tmdb.ts`)
+1. Add `searchTMDBCandidates(query: string, category: string, limit = 5)`:
+   - Queries TMDB API for all potential matches.
+   - Maps results to candidate objects:
+     ```typescript
+     export interface TMDBCandidate {
+       tmdb_id: number;
+       title: string;
+       year?: number;
+       poster_url?: string;
+       hasCover: boolean;
+       overview?: string;
+       rating?: string;
+       category: string;
+     }
      ```
-   - Automatically pass the copied message to `handleUploadedRenamedMedia` in the indexer.
-   - The media is indexed into SQLite and announced to `@VinehillMain` as normal!
+   - Filters and flags whether each candidate has valid poster art.
+
+### B. Pre-Processing Verification in Staging (`src/bot/handlers/indexer.ts`)
+1. When raw media arrives in `STORAGE_CHANNELS`:
+   - Parse detected filename with `parseFilename(detectedName)`.
+   - Query TMDB for the primary match.
+   - **Check**: Does the match exist AND is `poster_url` present?
+   - **If YES**: Queue the rename job with verified metadata.
+   - **If NO (Missing Title or Missing Poster)**:
+     - Hold job in `pending_staging_corrections`.
+     - Alert Admin with failure details and interactive buttons:
+       - `[🔍 Search & Pick Title]` (inline live search)
+       - `[✏️ Type Title / Keywords]` (direct message prompt)
+       - `[🗑️ Discard Staged File]`
+
+### C. Verification in Announcer Pipeline (`src/bot/handlers/announcer.ts`)
+1. Before publishing an announcement in `_doAnnounce()`:
+   - Verify that `f.poster_url` is present and valid.
+   - If missing:
+     - Hold the announcement in `pending_announcement_corrections`.
+     - Alert the admin:
+       ```html
+       📢 <b>Announcement Held: Missing Cover Art or Title</b>
+       🎬 <b>Title:</b> <code>${f.title}</code>
+       ❌ Cover art is required before public announcement.
+       ```
+     - Provide the same interactive correction buttons: `[🔍 Search & Pick Title]` and `[✏️ Type Title]`.
+     - Once the admin selects a valid candidate with cover art, update the database record and proceed with the announcement card in `@VinehillMain` and target channels.
+
+### D. Interactive Suggestion UI & Selection Flow (`src/bot/handlers/admin.ts`)
+1. **Interactive Search & Suggestions**:
+   - When the admin taps `[✏️ Type Title / Keywords]`:
+     - The bot prompts: `✏️ <b>Enter Title or Search Keywords</b>\n\nType any part of the title (e.g. <i>Hacksaw</i> or <i>Stranger Things</i>):`
+   - When the admin sends a text message:
+     - The bot queries `searchTMDBCandidates(query, category, 5)`.
+     - If candidates are found, the bot displays an interactive suggestion menu:
+       ```html
+       🔍 <b>Select Matching Title from TMDB:</b>
+
+       1️⃣ <b>Hacksaw Ridge</b> (2016) • [Cover Art: ✅]
+       2️⃣ <b>Hacksaw</b> (2020) • [Cover Art: ✅]
+       3️⃣ <b>Hacksaw: Retrospective</b> (2018) • [Cover Art: ❌]
+       ```
+       Inline buttons:
+       - `[1️⃣ Hacksaw Ridge (2016)]`
+       - `[2️⃣ Hacksaw (2020)]`
+       - `[🔄 Search Different Keyword]`
+   - When the admin taps a candidate:
+     - If `candidate.hasCover === false`: Alert admin: `"⚠️ This entry has no cover art on TMDB. Please select one with cover art."`
+     - If `candidate.hasCover === true`:
+       - Bind metadata (`title`, `year`, `poster_url`, etc.).
+       - Resume staging processing (download/rename) or publish announcement.
+       - Send confirmation card with verified poster preview.
 
 ---
 
 ## 3. Verification Plan
 1. **Lint & Build**:
-   - Run `lint_applet` (`tsc --noEmit`) to verify zero type errors.
-   - Run `compile_applet` to confirm a clean build.
-2. **Session Persistence**:
-   - Verify `db.getConfig('TELEGRAM_SESSION')` saves and reloads across restarts.
-3. **Fallback Verification**:
-   - When MTProto is under FloodWait, simulate or verify that staging channel files are smoothly copied, captioned, and indexed via Bot API rather than skipped.
+   - Run `lint_applet` (`tsc --noEmit`) to verify clean TypeScript compilation.
+   - Run `compile_applet` to confirm successful build.
+2. **Interactive Search Verification**:
+   - Test typing a partial keyword (e.g., `"Hacksaw"`) and confirm selectable candidate buttons appear with cover art badges.
+   - Test selecting a candidate: verify that full title and poster are bound and pipeline commences.
+   - Test Announcer verification: verify announcements without cover art are paused until verified.

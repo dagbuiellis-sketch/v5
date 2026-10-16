@@ -1,6 +1,6 @@
 {
-  "summary": "Implementation plan to resolve GramJS MTProto FloodWait error by persisting authorization sessions in the SQLite database and introducing a seamless Bot API copyMessage fallback so files are never skipped or lost.",
-  "updatedAt": "2026-10-16T12:37:50.218544890Z",
+  "summary": "Revised implementation plan incorporating TMDB title and cover art validation into both the staging renamer and the public announcer, with live selectable search suggestions (multi-result candidate buttons and inline suggestions) when the admin corrects titles.",
+  "updatedAt": "2026-10-16T18:10:33.605936707Z",
   "requestFeedback": true,
   "userFacing": true
 }
