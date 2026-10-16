@@ -1,6 +1,6 @@
 {
-  "summary": "Revised implementation plan incorporating TMDB title and cover art validation into both the staging renamer and the public announcer, with live selectable search suggestions (multi-result candidate buttons and inline suggestions) when the admin corrects titles.",
-  "updatedAt": "2026-10-16T18:10:33.605936707Z",
+  "summary": "Implementation plan to fix TMDB title search and suggestions for the admin, adding multi-endpoint fallback, v3/v4 token support, clean query parsing, inline live typing suggestions, and /settmdb diagnostics.",
+  "updatedAt": "2026-10-16T18:36:40.270405969Z",
   "requestFeedback": true,
   "userFacing": true
 }

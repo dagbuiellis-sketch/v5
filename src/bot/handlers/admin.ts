@@ -13,7 +13,12 @@ import {
   getAdminSession,
   clearAdminSession,
 } from '../corrections';
-import { searchTMDBCandidates, getTMDBDetails } from '../tmdb';
+import {
+  searchTMDBCandidates,
+  searchTMDBCandidatesWithDiagnostics,
+  getTMDBDetails,
+  testTmdbConnection,
+} from '../tmdb';
 
 const logger = pino({
   transport: {
@@ -128,6 +133,50 @@ export function registerAdmin() {
     
     db.setConfig('ADMIN_ID', newAdminId);
     ctx.reply(`✅ <b>Admin ID updated!</b>\n\nNew Admin: <code>${newAdminId}</code>\n\n<i>Note: You may lose access if this is not your ID.</i>`, { parse_mode: 'HTML' });
+  });
+
+  // Configure or update TMDB API Key / Token
+  bot.command(['settmdb', 'tmdbkey'], async (ctx) => {
+    if (ctx.from.id.toString() !== getAdminId()) {
+      return ctx.reply('Forbidden.');
+    }
+
+    const newKey = ctx.payload.trim();
+    if (!newKey) {
+      const current = await testTmdbConnection();
+      return ctx.reply(
+        `ℹ️ <b>TMDB Key Status</b>\n\n${current.message}\n\n` +
+        `To update the key, send: <code>/settmdb &lt;your_tmdb_api_key_or_v4_token&gt;</code>`,
+        { parse_mode: 'HTML' }
+      );
+    }
+
+    // Strip quotes or whitespace
+    const cleanedKey = newKey.replace(/^["']|["']$/g, '').trim();
+    db.setConfig('TMDB_API_KEY', cleanedKey);
+
+    const testResult = await testTmdbConnection();
+    if (testResult.success) {
+      return ctx.reply(
+        `✅ <b>TMDB API Key Saved & Verified!</b>\n\n${testResult.message}`,
+        { parse_mode: 'HTML' }
+      );
+    } else {
+      return ctx.reply(
+        `⚠️ <b>TMDB API Key Saved, but connection test failed:</b>\n\n${testResult.message}\n\nPlease verify that the key or Bearer token is valid.`,
+        { parse_mode: 'HTML' }
+      );
+    }
+  });
+
+  // Test TMDB API Connection
+  bot.command(['testtmdb', 'tmdbstatus'], async (ctx) => {
+    if (ctx.from.id.toString() !== getAdminId()) return;
+    const result = await testTmdbConnection();
+    return ctx.reply(
+      `🧪 <b>TMDB Connection Test</b>\n\n${result.message}`,
+      { parse_mode: 'HTML' }
+    );
   });
 
   bot.command('reannounce', async (ctx) => {
@@ -660,6 +709,114 @@ export function registerAdmin() {
     await ctx.deleteMessage().catch(() => {});
   });
 
+  // Shared resolver for title candidates (from both inline search and chat buttons)
+  async function resolveTitleCandidate(
+    ctx: any,
+    type: 'staging' | 'announcement',
+    correctionId: string,
+    tmdbId: number,
+    categoryHint?: string,
+    isEdit = true
+  ) {
+    let category = categoryHint || 'movies';
+    if (type === 'staging') {
+      const p = getStagingCorrection(correctionId);
+      if (p) category = p.category;
+    } else {
+      const p = getAnnounceCorrection(correctionId);
+      if (p) category = p.fileData.category;
+    }
+
+    if (ctx.answerCbQuery) {
+      await ctx.answerCbQuery('⏳ Verifying candidate with TMDB...').catch(() => {});
+    }
+
+    const meta = await getTMDBDetails(tmdbId, category);
+    if (!meta || !meta.poster_url || meta.poster_url.trim().length === 0) {
+      const warning = '⚠️ This title has no poster cover art on TMDB! Please select one with cover art.';
+      if (ctx.answerCbQuery) {
+        return ctx.answerCbQuery(warning, { show_alert: true });
+      } else {
+        return ctx.reply(warning);
+      }
+    }
+
+    clearAdminSession(ctx.from.id.toString());
+
+    if (type === 'staging') {
+      const pending = getStagingCorrection(correctionId);
+      if (!pending) {
+        const msg = '⚠️ Staged job expired or already processed.';
+        return isEdit ? ctx.editMessageText(msg).catch(() => ctx.reply(msg)) : ctx.reply(msg);
+      }
+      removeStagingCorrection(correctionId);
+
+      const confirmText =
+        `✅ <b>Title & Cover Art Verified!</b>\n\n` +
+        `🎬 <b>Title:</b> <b>${meta.title}</b> (${meta.year || 'N/A'})\n` +
+        `🖼 <b>Cover Art:</b> Verified ✅\n` +
+        `⚡ <b>Processing has started for:</b> <code>${pending.originalFileName}</code>`;
+
+      if (isEdit) {
+        await ctx.editMessageText(confirmText, { parse_mode: 'HTML' }).catch(() => ctx.reply(confirmText, { parse_mode: 'HTML' }));
+      } else {
+        await ctx.reply(confirmText, { parse_mode: 'HTML' });
+      }
+
+      const { queueRenameJob } = await import('../renamer');
+      queueRenameJob({
+        sourceChannelId: pending.sourceChannelId,
+        sourceMessageId: pending.sourceMessageId,
+        originalFileName: pending.originalFileName,
+        fileSize: pending.fileSize,
+        category: pending.category,
+        customTitle: meta.title,
+        customYear: meta.year,
+        verifiedMeta: meta,
+      });
+
+    } else if (type === 'announcement') {
+      const pending = getAnnounceCorrection(correctionId);
+      if (!pending) {
+        const msg = '⚠️ Announcement expired or already broadcast.';
+        return isEdit ? ctx.editMessageText(msg).catch(() => ctx.reply(msg)) : ctx.reply(msg);
+      }
+      removeAnnounceCorrection(correctionId);
+
+      // Update database record with new verified metadata
+      const oldTitle = pending.fileData.title;
+      const fileCat = pending.fileData.category;
+      db.db.prepare(`
+        UPDATE files 
+        SET title = ?, year = ?, poster_url = ?, overview = ?, rating = ?, genres = ?, tmdb_id = ? 
+        WHERE title = ? AND category = ?
+      `).run(meta.title, meta.year, meta.poster_url, meta.overview, meta.rating, meta.genres, meta.tmdb_id, oldTitle, fileCat);
+
+      pending.fileData.title = meta.title;
+      pending.fileData.year = meta.year;
+      pending.fileData.poster_url = meta.poster_url;
+      pending.fileData.overview = meta.overview;
+      pending.fileData.genres = meta.genres;
+      pending.fileData.rating = meta.rating;
+      pending.fileData.tmdb_id = meta.tmdb_id;
+
+      const confirmText =
+        `✅ <b>Announcement Verified & Released!</b>\n\n` +
+        `🎬 <b>Title:</b> <b>${meta.title}</b> (${meta.year || 'N/A'})\n` +
+        `🖼 <b>Cover Art:</b> Attached ✅\n` +
+        `📢 Broadcasting to public channels now...`;
+
+      if (isEdit) {
+        await ctx.editMessageText(confirmText, { parse_mode: 'HTML' }).catch(() => ctx.reply(confirmText, { parse_mode: 'HTML' }));
+      } else {
+        await ctx.reply(confirmText, { parse_mode: 'HTML' });
+      }
+
+      const { retryAnnounce } = await import('./announcer');
+      await retryAnnounce(pending.fileData);
+    }
+  }
+
   // Start title correction session for staging
   bot.action(/^fix_stg:(.+)$/, async (ctx) => {
     if (ctx.from.id.toString() !== getAdminId()) {
@@ -681,9 +838,23 @@ export function registerAdmin() {
     await ctx.reply(
       `✏️ <b>Enter Title or Search Keywords</b>\n\n` +
       `📁 <b>File:</b> <code>${pending.originalFileName}</code>\n\n` +
-      `Type the correct movie or series name (e.g. <code>Hacksaw</code> or <code>Hacksaw Ridge</code>).\n` +
-      `I will search TMDB and give you live suggestions with cover art to select!`,
-      { parse_mode: 'HTML', reply_markup: { force_reply: true } }
+      `💡 <b>Choose how you want to search:</b>\n` +
+      `1️⃣ Tap <b>🔎 Live Suggest As You Type</b> below to see live poster cards as you type in Telegram!\n` +
+      `2️⃣ OR simply reply directly to this message with the title (e.g. <code>Hacksaw Ridge</code>).`,
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: '🔎 Live Suggest As You Type (Inline)',
+                switch_inline_query_current_chat: `tmdb:${id}:${pending.category} `,
+              },
+            ],
+            [{ text: '❌ Cancel Session', callback_data: 'cancel_fix_session' }],
+          ],
+        },
+      }
     );
   });
 
@@ -708,9 +879,23 @@ export function registerAdmin() {
     await ctx.reply(
       `✏️ <b>Enter Title or Search Keywords</b>\n\n` +
       `🎬 <b>Held Announcement:</b> <b>${pending.fileData.title}</b>\n\n` +
-      `Type the correct title or search keywords.\n` +
-      `I will search TMDB and provide clickable suggestions with cover art!`,
-      { parse_mode: 'HTML', reply_markup: { force_reply: true } }
+      `💡 <b>Choose how you want to search:</b>\n` +
+      `1️⃣ Tap <b>🔎 Live Suggest As You Type</b> below to see live poster cards as you type in Telegram!\n` +
+      `2️⃣ OR simply reply directly to this message with the title (e.g. <code>Hacksaw Ridge</code>).`,
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: '🔎 Live Suggest As You Type (Inline)',
+                switch_inline_query_current_chat: `tmdb:${id}:${pending.fileData.category} `,
+              },
+            ],
+            [{ text: '❌ Cancel Session', callback_data: 'cancel_fix_session' }],
+          ],
+        },
+      }
     );
   });
 
@@ -744,96 +929,27 @@ export function registerAdmin() {
     await ctx.deleteMessage().catch(() => {});
   });
 
-  // Pick TMDB candidate button
+  // Pick TMDB candidate button (from chat button click)
   bot.action(/^pick_tmdb:([^:]+):([^:]+):(\d+)$/, async (ctx) => {
     if (ctx.from.id.toString() !== getAdminId()) {
       return ctx.answerCbQuery('Forbidden', { show_alert: true });
     }
-
     const type = ctx.match[1] as 'staging' | 'announcement';
     const correctionId = ctx.match[2];
     const tmdbId = parseInt(ctx.match[3]);
+    await resolveTitleCandidate(ctx, type, correctionId, tmdbId, undefined, true);
+  });
 
-    let category = 'movies';
-    if (type === 'staging') {
-      const p = getStagingCorrection(correctionId);
-      if (p) category = p.category;
-    } else {
-      const p = getAnnounceCorrection(correctionId);
-      if (p) category = p.fileData.category;
-    }
-
-    await ctx.answerCbQuery('⏳ Verifying candidate with TMDB...').catch(() => {});
-
-    const meta = await getTMDBDetails(tmdbId, category);
-    if (!meta || !meta.poster_url || meta.poster_url.trim().length === 0) {
-      return ctx.answerCbQuery('⚠️ This title has no poster cover art on TMDB! Please select one with cover art.', { show_alert: true });
-    }
-
-    clearAdminSession(ctx.from.id.toString());
-
-    if (type === 'staging') {
-      const pending = getStagingCorrection(correctionId);
-      if (!pending) {
-        return ctx.editMessageText('⚠️ Staged job expired or already processed.').catch(() => {});
-      }
-      removeStagingCorrection(correctionId);
-
-      const confirmText =
-        `✅ <b>Title & Cover Art Verified!</b>\n\n` +
-        `🎬 <b>Title:</b> <b>${meta.title}</b> (${meta.year || 'N/A'})\n` +
-        `🖼 <b>Cover Art:</b> Verified ✅\n` +
-        `⚡ <b>Processing has started for:</b> <code>${pending.originalFileName}</code>`;
-
-      await ctx.editMessageText(confirmText, { parse_mode: 'HTML' }).catch(() => {});
-
-      const { queueRenameJob } = await import('../renamer');
-      queueRenameJob({
-        sourceChannelId: pending.sourceChannelId,
-        sourceMessageId: pending.sourceMessageId,
-        originalFileName: pending.originalFileName,
-        fileSize: pending.fileSize,
-        category: pending.category,
-        customTitle: meta.title,
-        customYear: meta.year,
-        verifiedMeta: meta,
-      });
-
-    } else if (type === 'announcement') {
-      const pending = getAnnounceCorrection(correctionId);
-      if (!pending) {
-        return ctx.editMessageText('⚠️ Announcement expired or already broadcast.').catch(() => {});
-      }
-      removeAnnounceCorrection(correctionId);
-
-      // Update database record with new verified metadata
-      const oldTitle = pending.fileData.title;
-      const fileCat = pending.fileData.category;
-      db.db.prepare(`
-        UPDATE files 
-        SET title = ?, year = ?, poster_url = ?, overview = ?, rating = ?, genres = ?, tmdb_id = ? 
-        WHERE title = ? AND category = ?
-      `).run(meta.title, meta.year, meta.poster_url, meta.overview, meta.rating, meta.genres, meta.tmdb_id, oldTitle, fileCat);
-
-      pending.fileData.title = meta.title;
-      pending.fileData.year = meta.year;
-      pending.fileData.poster_url = meta.poster_url;
-      pending.fileData.overview = meta.overview;
-      pending.fileData.genres = meta.genres;
-      pending.fileData.rating = meta.rating;
-      pending.fileData.tmdb_id = meta.tmdb_id;
-
-      const confirmText =
-        `✅ <b>Announcement Verified & Released!</b>\n\n` +
-        `🎬 <b>Title:</b> <b>${meta.title}</b> (${meta.year || 'N/A'})\n` +
-        `🖼 <b>Cover Art:</b> Attached ✅\n` +
-        `📢 Broadcasting to public channels now...`;
-
-      await ctx.editMessageText(confirmText, { parse_mode: 'HTML' }).catch(() => {});
-
-      const { retryAnnounce } = await import('./announcer');
-      await retryAnnounce(pending.fileData);
-    }
+  // Pick TMDB candidate from inline search query result (/picktmdb <correctionId> <tmdbId> <category>)
+  bot.command('picktmdb', async (ctx) => {
+    if (ctx.from.id.toString() !== getAdminId()) return;
+    const parts = ctx.payload.trim().split(/\s+/);
+    if (parts.length < 2) return;
+    const correctionId = parts[0];
+    const tmdbId = parseInt(parts[1]);
+    const category = parts[2] || 'movies';
+    const type = correctionId.startsWith('stg_') ? 'staging' : 'announcement';
+    await resolveTitleCandidate(ctx, type, correctionId, tmdbId, category, false);
   });
 
   // Text listener for title typing / keyword suggestions
@@ -854,24 +970,50 @@ export function registerAdmin() {
 
     const loadingMsg = await ctx.reply(`🔍 Searching TMDB for "<b>${query}</b>"...`, { parse_mode: 'HTML' }).catch(() => null);
 
-    const candidates = await searchTMDBCandidates(query, session.category, 5);
+    const { candidates, error, statusCode } = await searchTMDBCandidatesWithDiagnostics(query, session.category, 6);
 
     if (loadingMsg) {
       await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
     }
 
     if (candidates.length === 0) {
+      if (error === 'TMDB_KEY_NOT_CONFIGURED') {
+        return ctx.reply(
+          `⚠️ <b>TMDB API Key Not Configured</b>\n\n` +
+          `The bot requires a TMDB API Key to search and fetch cover art.\n\n` +
+          `Set your key now by sending:\n<code>/settmdb &lt;your_tmdb_api_key_or_v4_token&gt;</code>`,
+          { parse_mode: 'HTML' }
+        );
+      }
+
+      if (statusCode === 401) {
+        return ctx.reply(
+          `❌ <b>TMDB Authentication Error (401 Unauthorized)</b>\n\n` +
+          `TMDB rejected your API key: <code>${error}</code>\n\n` +
+          `Please update your key using:\n<code>/settmdb &lt;valid_key_or_token&gt;</code>`,
+          { parse_mode: 'HTML' }
+        );
+      }
+
       return ctx.reply(
         `❌ <b>No Matching Titles Found on TMDB</b>\n\n` +
-        `Could not find any matches for "<code>${query}</code>".\n\n` +
-        `Please check the spelling or type a broader keyword:`,
+        `Could not find any matches for "<code>${query}</code>" (${error || '0 results'}).\n\n` +
+        `💡 <i>Tips:</i>\n` +
+        `• Check spelling or try a shorter/broader keyword.\n` +
+        `• Or tap <b>Live Suggest As You Type</b> to search interactively:`,
         {
           parse_mode: 'HTML',
           reply_markup: {
             inline_keyboard: [
-              [{ text: '❌ Cancel Correction', callback_data: 'cancel_fix_session' }]
-            ]
-          }
+              [
+                {
+                  text: '🔎 Live Suggest As You Type (Inline)',
+                  switch_inline_query_current_chat: `tmdb:${session.correctionId}:${session.category} ${query}`,
+                },
+              ],
+              [{ text: '❌ Cancel Correction', callback_data: 'cancel_fix_session' }],
+            ],
+          },
         }
       );
     }
@@ -880,11 +1022,17 @@ export function registerAdmin() {
       `${i + 1}️⃣ <b>${c.title}</b> (${c.year || 'N/A'})\n   🖼 Cover Art: ${c.hasCover ? '✅ Available' : '❌ Missing'}`
     ).join('\n\n');
 
-    const keyboard = candidates.map((c, i) => ([{
+    const keyboard: any[][] = candidates.map((c, i) => ([{
       text: `${i + 1}️⃣ ${c.title} (${c.year || 'N/A'}) ${c.hasCover ? '✅' : '❌'}`,
       callback_data: `pick_tmdb:${session.type}:${session.correctionId}:${c.tmdb_id}`
     }]));
 
+    keyboard.push([
+      {
+        text: '🔎 Live Suggest As You Type (Inline)',
+        switch_inline_query_current_chat: `tmdb:${session.correctionId}:${session.category} ${query}`,
+      },
+    ]);
     keyboard.push([{ text: '❌ Cancel', callback_data: 'cancel_fix_session' }]);
 
     await ctx.reply(

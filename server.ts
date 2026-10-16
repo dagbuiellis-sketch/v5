@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
@@ -36,7 +37,9 @@ async function setBotCommands(app: any) {
       { command: 'reannounce', description: '📢 [ADMIN] Force re-announce all media' },
       { command: 'delete', description: '🗑️ [ADMIN] Delete media from library' },
       { command: 'purge', description: '🧹 [ADMIN] Purge orphaned entries' },
-      { command: 'backup', description: '📦 [ADMIN] Trigger manual database backup' }
+      { command: 'backup', description: '📦 [ADMIN] Trigger manual database backup' },
+      { command: 'settmdb', description: '🔑 [ADMIN] Set TMDB API Key / Token' },
+      { command: 'testtmdb', description: '🧪 [ADMIN] Test TMDB API Connection' }
     ]);
     logger.info('Bot commands registered with Telegram.');
   } catch (e) {

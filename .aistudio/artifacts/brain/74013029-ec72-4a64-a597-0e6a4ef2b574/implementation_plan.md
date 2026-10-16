@@ -1,95 +1,49 @@
-# Implementation Plan: Title & Cover Art Verification Gate with Interactive Suggestions
+# Implementation Plan: TMDB Title Correction, Live Suggestions & Key Diagnostics
 
-## 1. Overview & User Additions
-This plan expands the verification gate based on user requirements:
-1. **Verification on Staging & Announcer**:
-   - Apply TMDB existence and cover art (`poster_url`) verification when raw files enter staging channels **and** before messages are published by the Announcer.
-   - If either the title does not exist or cover art is missing, the file/announcement is **strictly paused**.
-2. **Interactive Suggestions While Typing**:
-   - When the admin provides a keyword or partial title, the bot queries TMDB `/search/multi` (or `/search/movie` / `/search/tv`) and immediately presents the **top matching candidates** as interactive 1-tap buttons (displaying Title, Release Year, and Cover Art status).
-   - In addition, an inline search button (`switch_inline_query_current_chat`) allows the admin to view live suggestions directly above their keyboard as they type.
+## 1. Problem Diagnosis
+1. **"Anything I enter says not found"**:
+   - In `src/bot/tmdb.ts`, `TMDB_API_KEY` was read only once from `process.env.TMDB_API_KEY` at module load time. If `.env` had quotes, spaces, or if the user used a TMDB v4 Read Access Token (starts with `ey...` instead of a 32-char v3 key), TMDB returns HTTP 401. Axios threw an error, was caught, and silently returned an empty array `[]`.
+   - In addition, `server.ts` lacked `import 'dotenv/config'`, which can cause environment variables from `.env` to be missing when run directly.
+   - The search strictly queried `/search/movie` or `/search/tv` without query sanitization (dots, `.mkv`, `720p`, release tags).
+2. **"Not giving any suggestions while typing"**:
+   - In standard Telegram text messages (`bot.on('text')`), Telegram does not send events until the user presses Enter/Send.
+   - Telegram supports **Inline Mode** (`switch_inline_query_current_chat`), which sends queries to the bot on every keystroke as the user types, displaying live popover cards with movie/series posters and titles.
 
----
+## 2. Proposed Changes
 
-## 2. Architecture & File Changes
+### A. Environment & TMDB Key Robustness (`server.ts`, `src/bot/tmdb.ts`, `src/bot/database.ts`)
+- Add `import 'dotenv/config'` to `server.ts`.
+- In `src/bot/tmdb.ts`, implement `getTmdbApiKey()` that checks:
+  1. `process.env.TMDB_API_KEY`
+  2. `process.env.TMDB_KEY`
+  3. `process.env.TMDB_TOKEN`
+  4. `db.getConfig('TMDB_API_KEY')`
+  5. Strips surrounding quotes (`"`, `'`) and whitespace.
+- Support both **v3 API Key** (`api_key` param) and **v4 Bearer Token** (`Authorization: Bearer <token>`).
+- Add `/settmdb <key>` and `/testtmdb` commands for the admin to configure and verify TMDB API connectivity with real-time feedback in Telegram.
 
-### A. TMDB Multi-Candidate Search Helper (`src/bot/tmdb.ts`)
-1. Add `searchTMDBCandidates(query: string, category: string, limit = 5)`:
-   - Queries TMDB API for all potential matches.
-   - Maps results to candidate objects:
-     ```typescript
-     export interface TMDBCandidate {
-       tmdb_id: number;
-       title: string;
-       year?: number;
-       poster_url?: string;
-       hasCover: boolean;
-       overview?: string;
-       rating?: string;
-       category: string;
-     }
-     ```
-   - Filters and flags whether each candidate has valid poster art.
+### B. Intelligent Candidate Search Pipeline (`src/bot/tmdb.ts`)
+- Create `searchTMDBCandidates(query, category)` with:
+  1. Raw query attempt.
+  2. Cleaned query attempt (stripping `.mkv`, `720p`, `1080p`, `x265`, `BRRip`, tags, release groups, and converting dots to spaces).
+  3. Multi-search fallback (`/search/multi`) if the category-specific search (`/search/movie` or `/search/tv`) yields zero results.
+  4. Explicit error categorization: if TMDB responds with 401 (Invalid Key) or 404, capture the exact error message so the admin is informed rather than seeing a generic "not found".
 
-### B. Pre-Processing Verification in Staging (`src/bot/handlers/indexer.ts`)
-1. When raw media arrives in `STORAGE_CHANNELS`:
-   - Parse detected filename with `parseFilename(detectedName)`.
-   - Query TMDB for the primary match.
-   - **Check**: Does the match exist AND is `poster_url` present?
-   - **If YES**: Queue the rename job with verified metadata.
-   - **If NO (Missing Title or Missing Poster)**:
-     - Hold job in `pending_staging_corrections`.
-     - Alert Admin with failure details and interactive buttons:
-       - `[🔍 Search & Pick Title]` (inline live search)
-       - `[✏️ Type Title / Keywords]` (direct message prompt)
-       - `[🗑️ Discard Staged File]`
+### C. Live Typing Suggestions (Inline Mode) & Chat Search (`src/bot/handlers/inline.ts`, `src/bot/handlers/admin.ts`)
+- In `fix_stg` and `fix_ann` prompts, offer two convenient ways to search:
+  1. **Inline Search (`🔎 Search as you type`)**: Opens `switch_inline_query_current_chat` with `@bot_username tmdb:<session_id> <title>`. Shows live results with posters and release year as the admin types.
+  2. **Direct Chat Message**: Admin can also reply with any title or keyword in chat.
+- Display clear status badges on search results:
+  - `✅ Cover Available` (can be selected to resume)
+  - `❌ Cover Missing` (alerts user to choose a title with cover art)
 
-### C. Verification in Announcer Pipeline (`src/bot/handlers/announcer.ts`)
-1. Before publishing an announcement in `_doAnnounce()`:
-   - Verify that `f.poster_url` is present and valid.
-   - If missing:
-     - Hold the announcement in `pending_announcement_corrections`.
-     - Alert the admin:
-       ```html
-       📢 <b>Announcement Held: Missing Cover Art or Title</b>
-       🎬 <b>Title:</b> <code>${f.title}</code>
-       ❌ Cover art is required before public announcement.
-       ```
-     - Provide the same interactive correction buttons: `[🔍 Search & Pick Title]` and `[✏️ Type Title]`.
-     - Once the admin selects a valid candidate with cover art, update the database record and proceed with the announcement card in `@VinehillMain` and target channels.
-
-### D. Interactive Suggestion UI & Selection Flow (`src/bot/handlers/admin.ts`)
-1. **Interactive Search & Suggestions**:
-   - When the admin taps `[✏️ Type Title / Keywords]`:
-     - The bot prompts: `✏️ <b>Enter Title or Search Keywords</b>\n\nType any part of the title (e.g. <i>Hacksaw</i> or <i>Stranger Things</i>):`
-   - When the admin sends a text message:
-     - The bot queries `searchTMDBCandidates(query, category, 5)`.
-     - If candidates are found, the bot displays an interactive suggestion menu:
-       ```html
-       🔍 <b>Select Matching Title from TMDB:</b>
-
-       1️⃣ <b>Hacksaw Ridge</b> (2016) • [Cover Art: ✅]
-       2️⃣ <b>Hacksaw</b> (2020) • [Cover Art: ✅]
-       3️⃣ <b>Hacksaw: Retrospective</b> (2018) • [Cover Art: ❌]
-       ```
-       Inline buttons:
-       - `[1️⃣ Hacksaw Ridge (2016)]`
-       - `[2️⃣ Hacksaw (2020)]`
-       - `[🔄 Search Different Keyword]`
-   - When the admin taps a candidate:
-     - If `candidate.hasCover === false`: Alert admin: `"⚠️ This entry has no cover art on TMDB. Please select one with cover art."`
-     - If `candidate.hasCover === true`:
-       - Bind metadata (`title`, `year`, `poster_url`, etc.).
-       - Resume staging processing (download/rename) or publish announcement.
-       - Send confirmation card with verified poster preview.
-
----
+### D. Verification & Resumption
+- When a candidate is chosen:
+  - Verify poster cover art.
+  - Resume the staging job (`queueRenameJob`) or release the held announcement.
 
 ## 3. Verification Plan
-1. **Lint & Build**:
-   - Run `lint_applet` (`tsc --noEmit`) to verify clean TypeScript compilation.
-   - Run `compile_applet` to confirm successful build.
-2. **Interactive Search Verification**:
-   - Test typing a partial keyword (e.g., `"Hacksaw"`) and confirm selectable candidate buttons appear with cover art badges.
-   - Test selecting a candidate: verify that full title and poster are bound and pipeline commences.
-   - Test Announcer verification: verify announcements without cover art are paused until verified.
+- Run `lint_applet` and `compile_applet`.
+- Verify query cleaning and candidate parsing logic.
+- Verify that both v3 keys and v4 Bearer tokens format requests properly.
+- Restart dev server.
