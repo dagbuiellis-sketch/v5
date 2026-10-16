@@ -1,33 +1,54 @@
-# Implementation Plan: Target Clown Reaction to Final Series File
+# Implementation Plan: Fix GramJS MTProto FloodWait & Enable Seamless Bot API Fallback
 
-## 1. Overview
-Currently, in `sendMediaBatch` within `src/bot/handlers/download.ts`, every delivered episode in a multi-file batch (e.g., full seasons or all seasons) triggers an individual clown emoji (`🤡`) reaction 1 second after delivery.
-As requested, for series (both TV Series and Anime), the clown reaction should be applied **only to the last file received by the user**. If a single episode is downloaded, that episode is the last (and only) file and will still receive the reaction.
+## 1. Problem Diagnosis
+In the provided logs:
+```
+FloodWaitError: A wait of 3125 seconds is required (caused by auth.ImportBotAuthorization)
+```
+- **Root Cause**: `initMTProtoClient()` initialized a new `StringSession('')` on startup without saving the session string to persistent storage. Every time the bot restarted or initialized, it called `client.start({ botAuthToken })`, invoking Telegram's `auth.importBotAuthorization`. Telegram enforces a rate-limit on new authorization handshakes from the same IP/token; once exceeded, it blocks new authorizations for ~52 minutes (3,125 seconds).
+- **Secondary Problem**: When `initMTProtoClient()` failed or returned `null`, `executeRenameJob()` logged a warning and skipped the file entirely. The file sat in the staging channel and was never copied, renamed, or indexed.
 
 ---
 
-## 2. Proposed Changes
+## 2. Solution Architecture
 
-### `src/bot/handlers/download.ts`
-1. **Differentiate Reaction Logic in `sendMediaBatch`**:
-   - Detect if the current batch is episodic (`series` or `anime` category).
-   - In the file delivery loop:
-     - Record all successfully sent messages into `sentMsgIds`.
-     - For non-series media (such as movies), continue applying the reaction or let the batch defer to the last file.
-     - For `series` and `anime`, suppress per-file intermediate reactions during the loop.
-   - After the delivery loop completes:
-     - Identify the last successfully delivered message (`sentMsgIds[sentMsgIds.length - 1]`).
-     - Schedule the `🤡` reaction via `setMessageReaction(ctx.telegram, ctx.from.id, lastSentMsgId, '🤡')` with the 1-second delay (`setTimeout(..., 1000)`).
-   - Ensure that in single-episode downloads (where `sentMsgIds.length === 1`), that single episode receives the reaction exactly as intended.
-   - In 429 retry edge-cases, maintain the same rule: intermediate files are not reacted, and only the final delivered file in the sequence gets the clown reaction.
+### A. Session Persistence (`src/bot/renamer.ts`)
+1. **Load Existing Session**:
+   - Check `process.env.TELEGRAM_SESSION` first.
+   - If not set, retrieve the saved session string from the SQLite `config` table (`db.getConfig('TELEGRAM_SESSION')`).
+2. **Persist Active Session**:
+   - Once `client.start()` succeeds, call `client.session.save()` and store the session key in SQLite (`db.setConfig('TELEGRAM_SESSION', sessionStr)`).
+   - Future bot restarts will reuse this authenticated session key, bypassing `auth.importBotAuthorization` and completely preventing future flood waits.
+
+### B. FloodWait Cooldown Handling & Admin Awareness (`src/bot/renamer.ts`)
+1. Detect `FloodWaitError` or `error.seconds` when starting GramJS:
+   - Calculate `floodWaitUntil = Date.now() + (seconds * 1000)`.
+   - Prevent redundant connection attempts until the cooldown has passed.
+2. Alert the bot administrator once with a clear status notice:
+   - Explain that Telegram MTProto is temporarily cooling down.
+   - Reassure that the automatic Bot API fallback is actively processing and indexing all files.
+
+### C. Automatic Zero-Loss Bot API Fallback (`src/bot/renamer.ts`)
+1. If GramJS MTProto is unavailable (due to FloodWait cooldown, unconfigured keys, or network limits):
+   - **Do not drop or skip files**.
+   - Use Telegram's Bot API (`bot.telegram.copyMessage`) to transfer the file from the staging channel directly to the target channel (`@renamed_movies`, `@renamed_series`, `@renamed_anime`).
+   - Format and attach the proper caption:
+     ```html
+     🎬 <b>{Title} ({Year})</b>
+     🏷 <i>{TargetFileName}</i>
+
+     @VinehillMain
+     ```
+   - Automatically pass the copied message to `handleUploadedRenamedMedia` in the indexer.
+   - The media is indexed into SQLite and announced to `@VinehillMain` as normal!
 
 ---
 
 ## 3. Verification Plan
-1. **Static Analysis & Compilation**:
-   - Run `lint_applet` (`tsc --noEmit`) to verify clean TypeScript compilation.
-   - Run `compile_applet` to verify build integrity.
-2. **Behavioral Verification**:
-   - Test full season / all seasons batch delivery: verify only the last episode message receives `🤡` after 1 second.
-   - Test single episode delivery: verify that the single episode receives `🤡` after 1 second.
-   - Test movie file delivery: verify movies continue to receive the `🤡` reaction.
+1. **Lint & Build**:
+   - Run `lint_applet` (`tsc --noEmit`) to verify zero type errors.
+   - Run `compile_applet` to confirm a clean build.
+2. **Session Persistence**:
+   - Verify `db.getConfig('TELEGRAM_SESSION')` saves and reloads across restarts.
+3. **Fallback Verification**:
+   - When MTProto is under FloodWait, simulate or verify that staging channel files are smoothly copied, captioned, and indexed via Bot API rather than skipped.

@@ -23,10 +23,11 @@ export const RENAMED_CHANNELS: Record<string, string> = {
 const apiId = process.env.API_ID ? parseInt(process.env.API_ID) : 0;
 const apiHash = process.env.API_HASH || '';
 const botToken = process.env.BOT_TOKEN || '';
-const sessionString = process.env.TELEGRAM_SESSION || '';
 
 let client: TelegramClient | null = null;
 let isClientReady = false;
+let floodWaitUntil = 0;
+let floodAlertSent = false;
 
 export async function initMTProtoClient(): Promise<TelegramClient | null> {
   if (client && isClientReady) return client;
@@ -35,10 +36,18 @@ export async function initMTProtoClient(): Promise<TelegramClient | null> {
     return null;
   }
 
+  // If currently in FloodWait cooldown, skip attempt to avoid spamming Telegram
+  if (Date.now() < floodWaitUntil) {
+    const remainingSecs = Math.ceil((floodWaitUntil - Date.now()) / 1000);
+    logger.info(`⏳ MTProto in FloodWait cooldown (${remainingSecs}s remaining). Using Bot API fallback.`);
+    return null;
+  }
+
   try {
+    const sessionString = process.env.TELEGRAM_SESSION || db.getConfig('TELEGRAM_SESSION') || '';
     const session = new StringSession(sessionString);
     client = new TelegramClient(session, apiId, apiHash, {
-      connectionRetries: 5,
+      connectionRetries: 3,
       useWSS: false,
     });
 
@@ -47,10 +56,43 @@ export async function initMTProtoClient(): Promise<TelegramClient | null> {
     });
 
     isClientReady = true;
+    floodWaitUntil = 0;
+    floodAlertSent = false;
+
+    // Persist authenticated session in SQLite so future restarts reuse it and avoid auth flood limits
+    try {
+      const savedSession = client.session.save() as unknown as string;
+      if (savedSession && savedSession !== sessionString) {
+        db.setConfig('TELEGRAM_SESSION', savedSession);
+        logger.info('💾 Persisted Telegram MTProto session to database.');
+      }
+    } catch (saveErr) {
+      logger.warn({ saveErr }, 'Could not save MTProto session');
+    }
+
     logger.info('🚀 GramJS MTProto client initialized successfully (2GB file pipeline active)!');
     return client;
-  } catch (error) {
-    logger.error({ err: error }, 'Failed to start GramJS MTProto client');
+  } catch (error: any) {
+    if (error?.message?.includes('FloodWaitError') || error?.seconds || error?.errorMessage === 'FLOOD') {
+      const waitSecs = Number(error.seconds) || 3600;
+      floodWaitUntil = Date.now() + (waitSecs * 1000);
+      const minutes = Math.ceil(waitSecs / 60);
+      logger.warn(`⏳ GramJS MTProto FloodWait active: wait of ${waitSecs}s (~${minutes} mins) required. Bot API fallback active.`);
+
+      const adminId = getAdminId();
+      if (adminId && !floodAlertSent) {
+        floodAlertSent = true;
+        bot.telegram.sendMessage(
+          adminId,
+          `⚠️ <b>Telegram MTProto FloodWait Active</b>\n\n` +
+          `Telegram requires a wait of <b>${minutes} minutes</b> (${waitSecs}s) before new authorizations.\n\n` +
+          `🛡️ <b>No files will be skipped!</b> Staging files are automatically processed via the <b>Bot API Fallback</b> (copied, renamed caption attached, and indexed) until the cooldown completes.`,
+          { parse_mode: 'HTML' }
+        ).catch(() => {});
+      }
+    } else {
+      logger.error({ err: error }, 'Failed to start GramJS MTProto client');
+    }
     client = null;
     isClientReady = false;
     return null;
@@ -118,14 +160,43 @@ export async function processRenameQueue() {
   isProcessingRename = false;
 }
 
+async function executeBotApiFallback(job: RenameJob, destinationChannel: string) {
+  const parsed = parseFilename(job.originalFileName);
+  const targetFileName = formatRenamedFilename(parsed, job.originalFileName);
+  const yearStr = parsed.year ? ` (${parsed.year})` : '';
+  const episodeStr = (parsed.season && parsed.episode) ? ` S${parsed.season}E${parsed.episode}` : '';
+  const caption = `🎬 <b>${parsed.title}${yearStr}${episodeStr}</b>\n🏷 <i>${targetFileName}</i>\n\n@VinehillMain`;
+
+  try {
+    const sourcePeer = /^-?\d+$/.test(job.sourceChannelId)
+      ? parseInt(job.sourceChannelId)
+      : job.sourceChannelId;
+
+    logger.info(`📋 Bot API Fallback: Transferring "${job.originalFileName}" from ${job.sourceChannelId} (msg: ${job.sourceMessageId}) to ${destinationChannel}...`);
+
+    const copiedMsg = await bot.telegram.copyMessage(destinationChannel, sourcePeer, job.sourceMessageId, {
+      caption,
+      parse_mode: 'HTML',
+    });
+
+    if (copiedMsg && copiedMsg.message_id) {
+      const { handleUploadedRenamedMedia } = await import('./handlers/indexer');
+      await handleUploadedRenamedMedia(
+        copiedMsg,
+        job.category,
+        targetFileName,
+        destinationChannel,
+        job.fileSize
+      );
+      logger.info(`✅ Successfully copied and indexed "${targetFileName}" via Bot API fallback!`);
+    }
+  } catch (fallbackErr) {
+    logger.error({ fallbackErr, job }, `Failed to execute Bot API fallback for ${job.originalFileName}`);
+  }
+}
+
 async function executeRenameJob(job: RenameJob) {
   currentActiveJob = job;
-  const mtClient = await initMTProtoClient();
-  if (!mtClient) {
-    logger.warn(`Skipping MTProto rename for ${job.originalFileName} because API_ID/API_HASH are not configured.`);
-    currentActiveJob = null;
-    return;
-  }
 
   const destinationChannel = RENAMED_CHANNELS[job.category];
   if (!destinationChannel) {
@@ -135,6 +206,19 @@ async function executeRenameJob(job: RenameJob) {
   }
 
   job.targetChannelId = destinationChannel;
+
+  const mtClient = await initMTProtoClient();
+  if (!mtClient) {
+    logger.info(`ℹ️ MTProto client unavailable for "${job.originalFileName}". Executing zero-loss Bot API fallback to ${destinationChannel}...`);
+    try {
+      await executeBotApiFallback(job, destinationChannel);
+    } catch (fallbackErr) {
+      logger.error({ fallbackErr }, `Bot API fallback failed for ${job.originalFileName}`);
+    } finally {
+      currentActiveJob = null;
+    }
+    return;
+  }
 
   const parsed = parseFilename(job.originalFileName);
   const targetFileName = formatRenamedFilename(parsed, job.originalFileName);

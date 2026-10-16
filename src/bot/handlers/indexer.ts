@@ -217,15 +217,20 @@ export async function handleUploadedRenamedMedia(
   uploadedMessage: any, 
   category: string, 
   renamedFileName: string, 
-  destinationChannel?: string
+  destinationChannel?: string,
+  explicitFileSize?: number
 ) {
   try {
     const parsed = parseFilename(renamedFileName);
     const meta = await searchTMDB(parsed.title, parsed.year, category);
 
-    const docId = uploadedMessage.media?.document?.id?.toString() || `${category}_${Date.now()}`;
+    const docId = uploadedMessage.media?.document?.id?.toString() || 
+                  uploadedMessage.document?.file_id || 
+                  uploadedMessage.video?.file_id || 
+                  uploadedMessage.audio?.file_id || 
+                  `${category}_${Date.now()}`;
     const channelId = destinationChannel ? destinationChannel.toString() : '';
-    const messageId = uploadedMessage.id || null;
+    const messageId = uploadedMessage.id || uploadedMessage.message_id || null;
 
     const fileData = {
       title: meta.title || parsed.title,
@@ -236,7 +241,12 @@ export async function handleUploadedRenamedMedia(
       episode: parsed.episode,
       file_id: docId,
       file_name: renamedFileName,
-      file_size: Number(uploadedMessage.media?.document?.size || 0),
+      file_size: explicitFileSize || Number(
+        uploadedMessage.media?.document?.size || 
+        uploadedMessage.document?.file_size || 
+        uploadedMessage.video?.file_size || 
+        0
+      ),
       tags: parsed.tags,
       tmdb_id: meta.tmdb_id,
       poster_url: meta.poster_url,
