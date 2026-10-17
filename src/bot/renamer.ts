@@ -165,15 +165,50 @@ export async function processRenameQueue() {
   isProcessingRename = false;
 }
 
+export function hasRelatedRenameJob(
+  category: string,
+  title: string,
+  tmdbId?: number | null,
+  excludeJobId?: string
+): boolean {
+  if (!['series', 'anime'].includes(category)) return false;
+
+  const normalizedTitle = title.trim().toLowerCase();
+
+  const isMatching = (job: RenameJob | null) => {
+    if (!job || job.isCancelled) return false;
+    if (excludeJobId && job.id === excludeJobId) return false;
+    if (job.category !== category) return false;
+
+    // Check TMDB ID match
+    if (tmdbId && job.verifiedMeta?.tmdb_id && job.verifiedMeta.tmdb_id === tmdbId) {
+      return true;
+    }
+
+    // Check parsed or custom title match
+    const jobTitle = (job.customTitle || job.verifiedMeta?.title || parseFilename(job.originalFileName).title || '').trim().toLowerCase();
+    if (jobTitle && (jobTitle === normalizedTitle || jobTitle.includes(normalizedTitle) || normalizedTitle.includes(jobTitle))) {
+      return true;
+    }
+
+    return false;
+  };
+
+  if (isMatching(currentActiveJob)) {
+    return true;
+  }
+
+  return renameQueue.some(job => isMatching(job));
+}
+
 async function executeBotApiFallback(job: RenameJob, destinationChannel: string) {
   const parsed = parseFilename(job.originalFileName);
   if (job.customTitle) parsed.title = job.customTitle;
   if (job.customYear) parsed.year = job.customYear;
 
   const targetFileName = formatRenamedFilename(parsed, job.originalFileName);
-  const yearStr = parsed.year ? ` (${parsed.year})` : '';
-  const episodeStr = (parsed.season && parsed.episode) ? ` S${parsed.season}E${parsed.episode}` : '';
-  const caption = `🎬 <b>${parsed.title}${yearStr}${episodeStr}</b>\n🏷 <i>${targetFileName}</i>\n\n@VinehillMain`;
+  // Compact caption for renamed channel: file name only
+  const caption = `<code>${targetFileName}</code>`;
 
   try {
     const sourcePeer = /^-?\d+$/.test(job.sourceChannelId)
@@ -195,7 +230,8 @@ async function executeBotApiFallback(job: RenameJob, destinationChannel: string)
         targetFileName,
         destinationChannel,
         job.fileSize,
-        job.verifiedMeta
+        job.verifiedMeta,
+        job.id
       );
       logger.info(`✅ Successfully copied and indexed "${targetFileName}" via Bot API fallback!`);
     }
@@ -225,6 +261,13 @@ async function executeRenameJob(job: RenameJob) {
       logger.error({ fallbackErr }, `Bot API fallback failed for ${job.originalFileName}`);
     } finally {
       currentActiveJob = null;
+      try {
+        const { notifyRenameJobFinished } = await import('./handlers/indexer');
+        const showTitle = job.customTitle || job.verifiedMeta?.title || parseFilename(job.originalFileName).title;
+        await notifyRenameJobFinished(job.category, showTitle, job.verifiedMeta?.tmdb_id);
+      } catch (notifyErr) {
+        logger.debug({ notifyErr }, 'Error notifying rename job completion to indexer');
+      }
     }
     return;
   }
@@ -239,7 +282,7 @@ async function executeRenameJob(job: RenameJob) {
   logger.info(`   Target: ${targetFileName}`);
   logger.info(`   Destination: ${destinationChannel}`);
 
-  // Channel live progress notification so channel admins/friends can monitor and cancel
+  // Channel live progress notification so channel admins can monitor and cancel
   let progressMsgId: number | null = null;
   let lastProgressEditTime = 0;
   const PROGRESS_THROTTLE_MS = 2500;
@@ -247,17 +290,14 @@ async function executeRenameJob(job: RenameJob) {
 
   try {
     const initialText =
-      `⚡ <b>Downloading & Renaming Media</b>\n\n` +
-      `📁 <b>File:</b> <code>${job.originalFileName}</code>\n` +
-      `🏷 <b>Target:</b> <code>${targetFileName}</code>\n` +
-      `📦 <b>Size:</b> ${sizeMB} MB | <b>Category:</b> ${job.category}\n` +
-      `⏳ <b>Status:</b> Initializing download...`;
+      `⚡ <code>${targetFileName}</code> (${sizeMB} MB)\n` +
+      `⏳ Initializing download...`;
 
     const sent = await bot.telegram.sendMessage(destinationChannel, initialText, {
       parse_mode: 'HTML',
       reply_markup: {
         inline_keyboard: [
-          [{ text: '🛑 Cancel Download & Rename', callback_data: `cancel_rename:${job.id}` }]
+          [{ text: '🛑 Cancel', callback_data: `cancel_rename:${job.id}` }]
         ]
       }
     });
@@ -274,17 +314,14 @@ async function executeRenameJob(job: RenameJob) {
     lastProgressEditTime = now;
 
     const text =
-      `⚡ <b>Downloading & Renaming Media</b>\n\n` +
-      `📁 <b>File:</b> <code>${job.originalFileName}</code>\n` +
-      `🏷 <b>Target:</b> <code>${targetFileName}</code>\n` +
-      `📦 <b>Size:</b> ${sizeMB} MB | <b>Category:</b> ${job.category}\n` +
-      `⏳ <b>Status:</b> ${statusText}`;
+      `⚡ <code>${targetFileName}</code> (${sizeMB} MB)\n` +
+      `⏳ ${statusText}`;
 
     const extra: any = { parse_mode: 'HTML' };
     if (showButton) {
       extra.reply_markup = {
         inline_keyboard: [
-          [{ text: '🛑 Cancel Download & Rename', callback_data: `cancel_rename:${job.id}` }]
+          [{ text: '🛑 Cancel', callback_data: `cancel_rename:${job.id}` }]
         ]
       };
     }
@@ -313,7 +350,7 @@ async function executeRenameJob(job: RenameJob) {
       const forwardedMsg = forwardedMsgs?.[0];
       if (forwardedMsg) {
         const { handleUploadedRenamedMedia } = await import('./handlers/indexer');
-        await handleUploadedRenamedMedia(forwardedMsg, job.category, targetFileName, destinationChannel, job.fileSize, job.verifiedMeta);
+        await handleUploadedRenamedMedia(forwardedMsg, job.category, targetFileName, destinationChannel, job.fileSize, job.verifiedMeta, job.id);
         logger.info(`✅ Successfully forwarded & indexed oversized file: ${targetFileName}`);
 
         if (destinationChannel && progressMsgId) {
@@ -321,10 +358,7 @@ async function executeRenameJob(job: RenameJob) {
             destinationChannel,
             progressMsgId,
             undefined,
-            `✅ <b>Oversized File Forwarded & Indexed!</b>\n\n` +
-            `🏷 <b>File:</b> <code>${targetFileName}</code>\n` +
-            `📢 <b>Destination:</b> ${destinationChannel}\n\n` +
-            `<i>⏱ Status message will auto-delete in 10s...</i>`,
+            `✅ <code>${targetFileName}</code>`,
             { parse_mode: 'HTML' }
           ).catch(() => {});
 
@@ -341,7 +375,7 @@ async function executeRenameJob(job: RenameJob) {
             destinationChannel,
             progressMsgId,
             undefined,
-            `🛑 <b>Download & Rename Cancelled</b>\n\n📁 File: <code>${job.originalFileName}</code>\n📋 Remaining queue: <b>${renameQueue.length}</b> job(s) intact.\n\n<i>⏱ Status message will auto-delete in 10s...</i>`,
+            `🛑 Cancelled: <code>${job.originalFileName}</code>`,
             { parse_mode: 'HTML' }
           ).catch(() => {});
 
@@ -354,6 +388,13 @@ async function executeRenameJob(job: RenameJob) {
       }
     } finally {
       currentActiveJob = null;
+      try {
+        const { notifyRenameJobFinished } = await import('./handlers/indexer');
+        const showTitle = job.customTitle || job.verifiedMeta?.title || parseFilename(job.originalFileName).title;
+        await notifyRenameJobFinished(job.category, showTitle, job.verifiedMeta?.tmdb_id);
+      } catch (notifyErr) {
+        logger.debug({ notifyErr }, 'Error notifying rename job completion to indexer');
+      }
     }
     return;
   }
@@ -394,7 +435,7 @@ async function executeRenameJob(job: RenameJob) {
         if (percent >= lastLoggedPercent + 20 || percent === 100) {
           lastLoggedPercent = percent;
           logger.info(`   Download progress: ${percent}%`);
-          updateChannelProgress(`📥 Downloading from storage: <b>${percent}%</b>`);
+          updateChannelProgress(`📥 Downloading: <b>${percent}%</b>`);
         }
       }) as any,
     });
@@ -402,12 +443,10 @@ async function executeRenameJob(job: RenameJob) {
     if (job.isCancelled) throw new Error('CANCELED_BY_ADMIN');
 
     logger.info(`✅ Download complete. Preparing upload as "${targetFileName}"...`);
-    await updateChannelProgress(`⚙️ Download complete. Uploading as <code>${targetFileName}</code>...`, true);
+    await updateChannelProgress(`⚙️ Uploading <code>${targetFileName}</code>...`, true);
 
-    // 3. Upload to target channel with the new filename and formatted caption
-    const yearStr = parsed.year ? ` (${parsed.year})` : '';
-    const episodeStr = (parsed.season && parsed.episode) ? ` S${parsed.season}E${parsed.episode}` : '';
-    const caption = `🎬 <b>${parsed.title}${yearStr}${episodeStr}</b>\n🏷 <i>${targetFileName}</i>\n\n@VinehillMain`;
+    // 3. Upload to target channel with compact caption (file name only)
+    const caption = `<code>${targetFileName}</code>`;
 
     let lastUploadPercent = 0;
     const uploadedMessage = await mtClient.sendFile(destinationChannel, {
@@ -423,7 +462,7 @@ async function executeRenameJob(job: RenameJob) {
         if (percent >= lastUploadPercent + 20 || percent === 100) {
           lastUploadPercent = percent;
           logger.info(`   Upload progress: ${percent}%`);
-          updateChannelProgress(`📤 Uploading to ${destinationChannel}: <b>${percent}%</b>`);
+          updateChannelProgress(`📤 Uploading: <b>${percent}%</b>`);
         }
       },
     });
@@ -434,18 +473,14 @@ async function executeRenameJob(job: RenameJob) {
 
     // 4. Pass the newly uploaded media to the indexer so it announces and indexes from the renamed channel
     const { handleUploadedRenamedMedia } = await import('./handlers/indexer');
-    await handleUploadedRenamedMedia(uploadedMessage, job.category, targetFileName, destinationChannel, job.fileSize, job.verifiedMeta);
+    await handleUploadedRenamedMedia(uploadedMessage, job.category, targetFileName, destinationChannel, job.fileSize, job.verifiedMeta, job.id);
 
     if (destinationChannel && progressMsgId) {
       bot.telegram.editMessageText(
         destinationChannel,
         progressMsgId,
         undefined,
-        `✅ <b>Download & Rename Complete!</b>\n\n` +
-        `🏷 <b>File:</b> <code>${targetFileName}</code>\n` +
-        `📢 <b>Destination:</b> ${destinationChannel}\n` +
-        `🤡 Media indexed and queued for announcement.\n\n` +
-        `<i>⏱ Status message will auto-delete in 10s...</i>`,
+        `✅ <code>${targetFileName}</code>`,
         { parse_mode: 'HTML' }
       ).catch(() => {});
 
@@ -458,14 +493,13 @@ async function executeRenameJob(job: RenameJob) {
     if (err?.message === 'CANCELED_BY_ADMIN' || job.isCancelled) {
       logger.warn(`🛑 Job ${job.id} for "${job.originalFileName}" was cancelled.`);
       if (destinationChannel && progressMsgId) {
-        const remainingCount = renameQueue.length;
-        const cancelText =
-          `🛑 <b>Download & Rename Cancelled</b>\n\n` +
-          `📁 <b>File:</b> <code>${job.originalFileName}</code>\n` +
-          `🧹 Temporary cache cleared immediately.\n` +
-          `📋 Remaining queue: <b>${remainingCount}</b> job(s) intact.\n\n` +
-          `<i>⏱ Status message will auto-delete in 10s...</i>`;
-        bot.telegram.editMessageText(destinationChannel, progressMsgId, undefined, cancelText, { parse_mode: 'HTML' }).catch(() => {});
+        bot.telegram.editMessageText(
+          destinationChannel,
+          progressMsgId,
+          undefined,
+          `🛑 Cancelled: <code>${job.originalFileName}</code>`,
+          { parse_mode: 'HTML' }
+        ).catch(() => {});
 
         setTimeout(() => {
           bot.telegram.deleteMessage(destinationChannel, progressMsgId!).catch(() => {});
@@ -478,7 +512,7 @@ async function executeRenameJob(job: RenameJob) {
           destinationChannel,
           progressMsgId,
           undefined,
-          `❌ <b>Download & Rename Failed</b>\n\n📁 File: <code>${job.originalFileName}</code>\n⚠️ Error: <code>${err?.message || 'Unknown error'}</code>\n\n<i>⏱ Status message will auto-delete in 10s...</i>`,
+          `❌ Failed: <code>${job.originalFileName}</code>`,
           { parse_mode: 'HTML' }
         ).catch(() => {});
 
@@ -489,6 +523,15 @@ async function executeRenameJob(job: RenameJob) {
     }
   } finally {
     currentActiveJob = null;
+    // Notify indexer that this job has completed/exited
+    try {
+      const { notifyRenameJobFinished } = await import('./handlers/indexer');
+      const showTitle = job.customTitle || job.verifiedMeta?.title || parseFilename(job.originalFileName).title;
+      await notifyRenameJobFinished(job.category, showTitle, job.verifiedMeta?.tmdb_id);
+    } catch (notifyErr) {
+      logger.debug({ notifyErr }, 'Error notifying rename job completion to indexer');
+    }
+
     // 5. Always delete the temporary file to keep disk clear
     if (fs.existsSync(tempFilePath)) {
       try {

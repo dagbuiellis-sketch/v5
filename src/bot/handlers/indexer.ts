@@ -99,54 +99,180 @@ async function handleIndexing(ctx: any, category: string, isScan = false) {
   db.addFile(fileData);
   logger.info(`Indexed: ${fileData.title} S${fileData.season}E${fileData.episode}`);
   
-  // Grouping logic for all categories to avoid spam and allow quality grouping
-  queueBatchAnnouncement(fileData);
+  await dispatchAnnouncement(fileData);
 }
 
-// Logic for batching announcements to avoid channel spam
-const _batchAnnounce = new Map<string, { data: any, count: number, timeout: NodeJS.Timeout }>();
+// Logic for smart batching announcements:
+// 1. Movies are announced IMMEDIATELY upon appearing in the renamed channel.
+// 2. Series & Anime hold announcements while any related episodes are in queue or actively renaming.
+// 3. Immediately once queue and active rename are empty, the show announcement fires.
+interface ShowBatchEntry {
+  category: string;
+  title: string;
+  tmdb_id?: number | null;
+  files: any[];
+  highestFile: any;
+  safetyTimer?: NodeJS.Timeout;
+}
 
-function queueBatchAnnouncement(data: any) {
-  // Use TMDB ID as key if available, otherwise fallback to title + category
-  // This prevents splitting show seasons if filenames have different years
-  const key = data.tmdb_id ? `tmdb:${data.tmdb_id}:${data.category}` : `${data.title}:${data.category}`;
+const _showBatches = new Map<string, ShowBatchEntry>();
+
+function getBatchKey(category: string, title: string, tmdbId?: number | null): string {
+  if (tmdbId) {
+    return `tmdb:${tmdbId}:${category.toLowerCase()}`;
+  }
+  return `${category.toLowerCase()}:${title.trim().toLowerCase()}`;
+}
+
+async function dispatchAnnouncement(fileData: any, fromJobId?: string) {
+  if (fileData.category === 'movies') {
+    logger.info(`🎬 Movie indexed in renamed channel: announcing immediately: "${fileData.title}"`);
+    const { announce } = await import('./announcer');
+    await announce(fileData);
+    return;
+  }
+
+  if (['series', 'anime'].includes(fileData.category)) {
+    await handleSeriesEpisodeAnnouncement(fileData, fromJobId);
+    return;
+  }
+
+  // Other categories (e.g. games) announce directly
+  const { announce } = await import('./announcer');
+  await announce(fileData);
+}
+
+async function handleSeriesEpisodeAnnouncement(fileData: any, fromJobId?: string) {
+  const key = getBatchKey(fileData.category, fileData.title, fileData.tmdb_id);
   
-  if (_batchAnnounce.has(key)) {
-    const existing = _batchAnnounce.get(key)!;
-    existing.count++;
-    
-    // Track the highest episode/season for the announcement summary
-    const currentMax = existing.data;
-    const isNewHigher = (data.season > (currentMax.season || 0)) || 
-                       (data.season === currentMax.season && (data.episode || 0) > (currentMax.episode || 0));
-    
-    if (isNewHigher) {
-      existing.data = data;
-    }
+  let batch = _showBatches.get(key);
+  if (!batch) {
+    batch = {
+      category: fileData.category,
+      title: fileData.title,
+      tmdb_id: fileData.tmdb_id,
+      files: [],
+      highestFile: fileData,
+    };
+    _showBatches.set(key, batch);
+  }
 
-    clearTimeout(existing.timeout);
-    existing.timeout = setTimeout(() => flushBatch(key), 30000); // 30s window
+  const alreadyInBatch = batch.files.some(f => f.file_id === fileData.file_id);
+  if (!alreadyInBatch) {
+    batch.files.push(fileData);
+  }
+
+  // Track the highest episode/season for the announcement summary
+  const currentMax = batch.highestFile;
+  const isNewHigher = (fileData.season > (currentMax.season || 0)) ||
+                     (fileData.season === currentMax.season && (fileData.episode || 0) > (currentMax.episode || 0));
+  if (isNewHigher) {
+    batch.highestFile = fileData;
+  }
+
+  const { hasRelatedRenameJob } = await import('../renamer');
+  const hasRelated = hasRelatedRenameJob(fileData.category, fileData.title, fileData.tmdb_id, fromJobId);
+
+  if (hasRelated) {
+    logger.info(`⏳ Related rename job(s) in queue or actively renaming for "${fileData.title}". Holding announcement...`);
+    if (batch.safetyTimer) clearTimeout(batch.safetyTimer);
+    // 10-minute fallback safety timer
+    batch.safetyTimer = setTimeout(() => {
+      logger.warn(`⚠️ Safety timeout reached for show batch "${fileData.title}". Flushing announcement.`);
+      flushShowBatch(key);
+    }, 10 * 60 * 1000);
+    return;
+  }
+
+  // No related jobs in queue or active rename:
+  if (batch.safetyTimer) clearTimeout(batch.safetyTimer);
+
+  if (fromJobId) {
+    logger.info(`✨ All rename jobs finished for "${fileData.title}". Announcing immediately!`);
+    await flushShowBatch(key);
   } else {
-    _batchAnnounce.set(key, {
-      data,
-      count: 1,
-      timeout: setTimeout(() => flushBatch(key), 30000)
-    });
+    // Direct channel post: short 3s window to group simultaneous uploads if any
+    batch.safetyTimer = setTimeout(() => {
+      flushShowBatch(key);
+    }, 3000);
   }
 }
 
-async function flushBatch(key: string) {
-  const info = _batchAnnounce.get(key);
-  if (!info) return;
-  _batchAnnounce.delete(key);
+export async function flushShowBatch(key: string) {
+  const batch = _showBatches.get(key);
+  if (!batch) return;
+  if (batch.safetyTimer) clearTimeout(batch.safetyTimer);
+  _showBatches.delete(key);
 
-  const { data, count } = info;
-  const { sendForConfirmation } = await import('./announcer');
-  
-  logger.info(`Flushing announcement batch for ${data.title} (${count} episodes)`);
-  // Overload total files for announcer UI
-  data.batchCount = count;
-  await sendForConfirmation(data);
+  const { files, highestFile } = batch;
+  if (!files || files.length === 0) return;
+
+  const count = files.length;
+  logger.info(`📢 Flushing announcement for "${highestFile.title}" (${count} episode(s))`);
+
+  // Calculate summary string
+  let summary = '';
+  const seasons = Array.from(new Set(files.map(f => f.season).filter(s => s !== null && s !== undefined)));
+  if (seasons.length === 1) {
+    summary = `Season ${seasons[0]} — ${count} episode(s)`;
+  } else if (seasons.length > 1) {
+    summary = `Seasons ${Math.min(...seasons)}–${Math.max(...seasons)} — ${count} files`;
+  } else {
+    summary = `${count} file(s)`;
+  }
+
+  const payload = {
+    ...highestFile,
+    batchCount: count,
+    summary,
+  };
+
+  const { announce } = await import('./announcer');
+  await announce(payload);
+
+  const adminId = getAdminId();
+  if (adminId) {
+    const logMsg =
+      `🚀 <b>Auto-Announced Batch</b>\n\n` +
+      `📺 <b>${payload.title}</b> (${payload.year})\n` +
+      `📦 ${summary}\n` +
+      `Category: ${payload.category}`;
+
+    await bot.telegram.sendMessage(adminId, logMsg, { parse_mode: 'HTML' }).catch(() => {});
+  }
+}
+
+export async function notifyRenameJobFinished(category: string, title: string, tmdbId?: number | null) {
+  if (!['series', 'anime'].includes(category)) return;
+
+  const key = getBatchKey(category, title, tmdbId);
+  let targetKey = _showBatches.has(key) ? key : null;
+
+  if (!targetKey) {
+    for (const [k, b] of _showBatches.entries()) {
+      if (b.category === category) {
+        if (tmdbId && b.tmdb_id && b.tmdb_id === tmdbId) {
+          targetKey = k;
+          break;
+        }
+        if (b.title.trim().toLowerCase() === title.trim().toLowerCase()) {
+          targetKey = k;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!targetKey) return;
+
+  const batch = _showBatches.get(targetKey)!;
+  const { hasRelatedRenameJob } = await import('../renamer');
+  const hasRelated = hasRelatedRenameJob(category, batch.title, batch.tmdb_id);
+
+  if (!hasRelated) {
+    logger.info(`🎯 All rename jobs completed for "${batch.title}". Announcing immediately!`);
+    await flushShowBatch(targetKey);
+  }
 }
 
 export async function scanChannel(ctx: any, category: string, limitCount = 100) {
@@ -219,7 +345,8 @@ export async function handleUploadedRenamedMedia(
   renamedFileName: string, 
   destinationChannel?: string,
   explicitFileSize?: number,
-  explicitMeta?: any
+  explicitMeta?: any,
+  fromRenameJobId?: string
 ) {
   try {
     const parsed = parseFilename(renamedFileName);
@@ -260,7 +387,7 @@ export async function handleUploadedRenamedMedia(
 
     db.addFile(fileData);
     logger.info(`Indexed renamed upload: ${fileData.title} (msg_id: ${messageId} in ${channelId})`);
-    queueBatchAnnouncement(fileData);
+    await dispatchAnnouncement(fileData, fromRenameJobId);
   } catch (err) {
     logger.error({ err }, 'Error handling uploaded renamed media');
   }

@@ -1,6 +1,6 @@
 {
-  "summary": "Implementation plan to fix TMDB title search and suggestions for the admin, adding multi-endpoint fallback, v3/v4 token support, clean query parsing, inline live typing suggestions, and /settmdb diagnostics.",
-  "updatedAt": "2026-10-16T18:36:40.270405969Z",
+  "summary": "Revised implementation plan to defer series/anime announcements until all queued or active episodes finish, announce movies immediately, simplify renamed channel captions to just the filename, and make renaming progress messages concise and compact.",
+  "updatedAt": "2026-10-17T00:34:06.775897305Z",
   "requestFeedback": true,
   "userFacing": true
 }

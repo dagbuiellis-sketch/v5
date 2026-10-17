@@ -1,49 +1,78 @@
-# Implementation Plan: TMDB Title Correction, Live Suggestions & Key Diagnostics
+# Implementation Plan: Smart Announcement Queueing, Instant Movie Announcements, & Minimal Channel Captions/Progress
 
-## 1. Problem Diagnosis
-1. **"Anything I enter says not found"**:
-   - In `src/bot/tmdb.ts`, `TMDB_API_KEY` was read only once from `process.env.TMDB_API_KEY` at module load time. If `.env` had quotes, spaces, or if the user used a TMDB v4 Read Access Token (starts with `ey...` instead of a 32-char v3 key), TMDB returns HTTP 401. Axios threw an error, was caught, and silently returned an empty array `[]`.
-   - In addition, `server.ts` lacked `import 'dotenv/config'`, which can cause environment variables from `.env` to be missing when run directly.
-   - The search strictly queried `/search/movie` or `/search/tv` without query sanitization (dots, `.mkv`, `720p`, release tags).
-2. **"Not giving any suggestions while typing"**:
-   - In standard Telegram text messages (`bot.on('text')`), Telegram does not send events until the user presses Enter/Send.
-   - Telegram supports **Inline Mode** (`switch_inline_query_current_chat`), which sends queries to the bot on every keystroke as the user types, displaying live popover cards with movie/series posters and titles.
+## 1. Overview & Requirements
+1. **Series & Anime Announcements**:
+   - When an episode of a series or anime is placed in the renamed channel, if another episode of the same series or anime is in queue or currently being renamed, do **not** announce yet.
+   - As soon as no related episodes remain in the queue or actively being renamed, immediately announce using the existing consolidated announcement logic.
+2. **Movie Announcements**:
+   - Movies must be announced immediately with zero delay when they appear in the renamed channel.
+3. **Clean, Non-Bulky Captions in Renamed Channel**:
+   - Since only admins are in the renamed channel, eliminate bulky captions (no redundant headers or channel tags). Set the caption to **just the file name** (`targetFileName`).
+4. **Streamlined, Less Bulky Progress Messages**:
+   - Simplify the progress status messages in the renamed channels so they don't clutter the chat.
+   - Replace the large multi-line block with a clean, compact status (e.g., `⚡ <code>${targetFileName}</code> (${sizeMB} MB)\n⏳ ${statusText}`).
 
-## 2. Proposed Changes
+---
 
-### A. Environment & TMDB Key Robustness (`server.ts`, `src/bot/tmdb.ts`, `src/bot/database.ts`)
-- Add `import 'dotenv/config'` to `server.ts`.
-- In `src/bot/tmdb.ts`, implement `getTmdbApiKey()` that checks:
-  1. `process.env.TMDB_API_KEY`
-  2. `process.env.TMDB_KEY`
-  3. `process.env.TMDB_TOKEN`
-  4. `db.getConfig('TMDB_API_KEY')`
-  5. Strips surrounding quotes (`"`, `'`) and whitespace.
-- Support both **v3 API Key** (`api_key` param) and **v4 Bearer Token** (`Authorization: Bearer <token>`).
-- Add `/settmdb <key>` and `/testtmdb` commands for the admin to configure and verify TMDB API connectivity with real-time feedback in Telegram.
+## 2. Technical Architecture & Proposed Changes
 
-### B. Intelligent Candidate Search Pipeline (`src/bot/tmdb.ts`)
-- Create `searchTMDBCandidates(query, category)` with:
-  1. Raw query attempt.
-  2. Cleaned query attempt (stripping `.mkv`, `720p`, `1080p`, `x265`, `BRRip`, tags, release groups, and converting dots to spaces).
-  3. Multi-search fallback (`/search/multi`) if the category-specific search (`/search/movie` or `/search/tv`) yields zero results.
-  4. Explicit error categorization: if TMDB responds with 401 (Invalid Key) or 404, capture the exact error message so the admin is informed rather than seeing a generic "not found".
+### A. Non-Bulky Caption & Compact Progress Messages (`src/bot/renamer.ts`)
+1. **Caption Simplification**:
+   - In `executeBotApiFallback`:
+     - Change caption from multi-line formatted text to just `<code>${targetFileName}</code>` (or plain `targetFileName`).
+   - In MTProto `sendFile`:
+     - Change caption from multi-line formatted text to `<code>${targetFileName}</code>`.
+2. **Compact Progress Message**:
+   - Initial message:
+     ```
+     ⚡ <b>Renaming:</b> <code>${targetFileName}</code> (${sizeMB} MB)
+     ⏳ Initializing...
+     ```
+     with `[🛑 Cancel]` button.
+   - Ongoing progress updates:
+     ```
+     ⚡ <b>Renaming:</b> <code>${targetFileName}</code> (${sizeMB} MB)
+     ⏳ ${statusText}
+     ```
+   - Completion message:
+     ```
+     ✅ <code>${targetFileName}</code> ready
+     ```
+     (auto-deletes after 10s to keep channel clean).
 
-### C. Live Typing Suggestions (Inline Mode) & Chat Search (`src/bot/handlers/inline.ts`, `src/bot/handlers/admin.ts`)
-- In `fix_stg` and `fix_ann` prompts, offer two convenient ways to search:
-  1. **Inline Search (`🔎 Search as you type`)**: Opens `switch_inline_query_current_chat` with `@bot_username tmdb:<session_id> <title>`. Shows live results with posters and release year as the admin types.
-  2. **Direct Chat Message**: Admin can also reply with any title or keyword in chat.
-- Display clear status badges on search results:
-  - `✅ Cover Available` (can be selected to resume)
-  - `❌ Cover Missing` (alerts user to choose a title with cover art)
+### B. Rename Queue State Inspection (`src/bot/renamer.ts`)
+1. Export helper `hasRelatedRenameJob(category: string, title: string, tmdbId?: number): boolean`:
+   - Inspects `currentActiveJob` and `renameQueue`.
+   - Filters to matching category (`series` or `anime`).
+   - Matches if:
+     - `job.verifiedMeta?.tmdb_id && tmdbId && job.verifiedMeta.tmdb_id === tmdbId`, OR
+     - `db.cleanTitle(job.customTitle || parseFilename(job.originalFileName).title) === db.cleanTitle(title)`.
+   - Returns `true` if any episode of the same show is currently being renamed or waiting in queue.
+2. Queue Drain / Completion Trigger:
+   - When a job finishes renaming in `renamer.ts` (both MTProto upload and fallback) and advances the queue, notify `indexer.ts` via an exported callback `checkPendingAnnouncements()`.
 
-### D. Verification & Resumption
-- When a candidate is chosen:
-  - Verify poster cover art.
-  - Resume the staging job (`queueRenameJob`) or release the held announcement.
+### C. Announcement Dispatch Logic (`src/bot/handlers/indexer.ts`)
+1. **Movies (Instant Announcement)**:
+   - When `category === 'movies'`, bypass the batch debounce timer completely and call `sendForConfirmation(fileData)` immediately.
+2. **Series & Anime (Queue-Aware Deferral & Immediate Flush)**:
+   - When an episode is indexed in `queueBatchAnnouncement(data)`:
+     - Check `hasRelatedRenameJob(data.category, data.title, data.tmdb_id)`.
+     - If `true` (more episodes are still being renamed or waiting in queue):
+       - Store/update the show's batch state (tracking episode counts, highest season/episode, and metadata).
+       - Mark `waitingForQueue: true` and hold announcement.
+     - If `false` (no other episodes in queue or active):
+       - Immediately flush the announcement (`flushBatch(key)`) without any extra delay.
+3. **Queue Completion Handler**:
+   - When `checkPendingAnnouncements()` is called after an active job finishes or the queue drains:
+     - Iterate through pending show batches in `_batchAnnounce`.
+     - For each show, re-check `hasRelatedRenameJob(...)`.
+     - If all related episodes have finished and are no longer in queue or active, immediately flush the consolidated announcement.
+
+---
 
 ## 3. Verification Plan
-- Run `lint_applet` and `compile_applet`.
-- Verify query cleaning and candidate parsing logic.
-- Verify that both v3 keys and v4 Bearer tokens format requests properly.
-- Restart dev server.
+1. **Build & Lint Checks**:
+   - Run `compile_applet` and `lint_applet` to confirm clean compilation and zero type errors.
+2. **Verification of Scenarios**:
+   - **Single Movie**: Upload/rename a movie -> verify caption is just `targetFileName`, progress message is compact, and announcement is triggered immediately.
+   - **Multiple Series Episodes**: Queue S01E01 and S01E02 of a series -> verify S01E01 uploads with simple caption, announcement is deferred while S01E02 is in queue/active, and upon S01E02 completing, the announcement fires immediately.
